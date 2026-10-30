@@ -1,0 +1,58 @@
+type: agent
+name: mcp_all_modes
+system_prompt: Use the configured MCP tools to answer the user's request.
+llm_config:
+  model: ${LLM_MODEL}
+  base_url: ${LLM_BASE_URL}
+  api_key: ${LLM_API_KEY}
+  api_type: openai_chat_completion
+
+# RFC-0029: all protocol and authentication modes are implemented by the
+# official MCP Python SDK. Replace endpoints/commands with your own servers.
+mcp_servers:
+  - name: local_stdio
+    type: stdio
+    command: python
+    args: ["./local_mcp_server.py"]
+    env:
+      SERVER_PROFILE: development
+
+  - name: streamable_http
+    type: http
+    url: https://mcp.example.com/mcp
+    headers:
+      X-Tenant: north
+
+  - name: legacy_sse
+    type: sse
+    url: https://legacy-mcp.example.com/sse
+    headers:
+      Authorization: Bearer legacy-token
+
+  - name: static_bearer
+    type: http
+    url: https://bearer-mcp.example.com/mcp
+    auth:
+      type: bearer
+      token:
+        source: env
+        key: BEARER_MCP_TOKEN
+
+  - name: oauth_user
+    type: http
+    url: https://oauth-mcp.example.com/mcp
+    auth:
+      type: authorization_code
+      client_name: NexAU CLI
+      scopes: ["tools:read", "tools:call"]
+
+  - name: oauth_service
+    type: http
+    url: https://service-mcp.example.com/mcp
+    auth:
+      type: client_credentials
+      client_id: nexau-service
+      client_secret:
+        source: env
+        key: SERVICE_MCP_CLIENT_SECRET
+      scopes: ["tools:call"]

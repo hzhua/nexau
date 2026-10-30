@@ -1,0 +1,358 @@
+# Copyright (c) Nex-AGI. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for run_shell_command builtin tool."""
+
+import threading
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from nexau.archs.main_sub.framework_context import FrameworkContext
+from nexau.archs.sandbox import SandboxStatus
+from nexau.archs.tool.builtin.shell_tools.run_shell_command import (
+    _truncate_shell_output,
+    run_shell_command,
+)
+from nexau.archs.tool.tool import Tool
+
+
+def _make_agent_state(sandbox):
+    """Create mock agent_state with sandbox."""
+    agent_state = Mock()
+    agent_state.get_sandbox.return_value = sandbox
+    return agent_state
+
+
+_RUN_SHELL_TOOL = Tool.from_yaml(
+    str(Path(__file__).parents[3] / "nexau/archs/tool/builtin/schemas/run_shell_command.tool.yaml"),
+    binding=run_shell_command,
+)
+
+
+def _format_shell_result(result: dict[str, object]) -> object:
+    """Pass a real builtin result through the formatter configured in its schema."""
+    return _RUN_SHELL_TOOL.format_output_for_llm(
+        tool_input={},
+        tool_output=result,
+        tool_call_id="call_123",
+        is_error=bool(result.get("error")),
+    )
+
+
+class TestTruncateShellOutput:
+    """Test _truncate_shell_output helper (keeps last N lines when output exceeds threshold)."""
+
+    def test_returns_unchanged_when_under_threshold(self):
+        """Should return content unchanged when under TRUNCATE_OUTPUT_THRESHOLD."""
+        content = "line1\nline2\nline3"
+        result = _truncate_shell_output(content)
+        assert result == content
+
+    @patch(
+        "nexau.archs.tool.builtin.shell_tools.run_shell_command.TRUNCATE_OUTPUT_THRESHOLD",
+        50,
+    )
+    def test_truncates_multi_line_keeping_last_n(self):
+        """Should keep last TRUNCATE_OUTPUT_LINES when multi-line output exceeds threshold."""
+        # Create content > 50 chars with multiple lines
+        lines = [f"Line {i}" for i in range(20)]
+        content = "\n".join(lines)
+        assert len(content) > 50
+
+        result = _truncate_shell_output(content)
+
+        assert "Output too large" in result
+        assert "Showing the last" in result
+        assert "of 20 lines" in result
+        # Last N lines (1000, but we only have 20) should be preserved
+        assert "Line 0" not in result or "lines" in result
+        assert "Line 19" in result
+
+    @patch(
+        "nexau.archs.tool.builtin.shell_tools.run_shell_command.TRUNCATE_OUTPUT_THRESHOLD",
+        50,
+    )
+    def test_truncates_single_massive_line_keeping_last_chars(self):
+        """Should keep last MAX_TRUNCATED_CHARS when single massive line exceeds threshold."""
+        content = "a" * 5000  # Single line, > 50 chars
+        result = _truncate_shell_output(content)
+
+        assert "Output too large" in result
+        assert "4,000" in result or "4000" in result
+        # Should contain last 4000 chars
+        assert result.endswith("a" * 4000)
+        assert "a" * 5000 not in result
+
+
+class TestRunShellCommandIntegration:
+    """Test run_shell_command with mocked sandbox (basic flow)."""
+
+    def test_basic_success_returns_output(self):
+        """Should return output on successful command."""
+        sandbox = Mock()
+        sandbox.work_dir = Path("/tmp/work")
+        sandbox.file_exists.return_value = True
+        info = Mock()
+        info.is_directory = True
+        sandbox.get_file_info.return_value = info
+        sandbox.prepare_shell_command.side_effect = lambda command: command
+
+        start_result = Mock()
+        start_result.background_pid = 123
+        sandbox.execute_shell.return_value = start_result
+
+        cmd_result = Mock()
+        cmd_result.stdout = "hello world"
+        cmd_result.stderr = ""
+        cmd_result.exit_code = 0
+        cmd_result.error = None
+        cmd_result.status = SandboxStatus.SUCCESS
+        cmd_result.output_dir = "/tmp/out"
+        cmd_result.stdout_file = "/tmp/out/stdout.txt"
+        cmd_result.stderr_file = "/tmp/out/stderr.txt"
+        cmd_result.truncated = False
+        cmd_result.original_stdout_length = None
+        cmd_result.original_stderr_length = None
+        sandbox.get_background_task_status.return_value = cmd_result
+
+        agent_state = _make_agent_state(sandbox)
+        ctx = FrameworkContext.for_testing()
+        result = run_shell_command("echo hello", agent_state=agent_state, ctx=ctx)
+
+        assert "error" not in result or result.get("error") is None
+        assert result["content"] == "hello world"
+        assert "hello world" in result["returnDisplay"]
+        assert "stdout" not in result
+        assert "stderr" not in result
+        assert result["interrupted"] is False
+        assert result["timed_out"] is False
+        assert _format_shell_result(result) == "hello world"
+
+    def test_empty_success_formats_without_output_prefix(self):
+        """Empty successful output should keep the existing sentinel without a label."""
+        sandbox = Mock()
+        sandbox.work_dir = Path("/tmp/work")
+        sandbox.prepare_shell_command.side_effect = lambda command: command
+
+        start_result = Mock()
+        start_result.background_pid = 123
+        sandbox.execute_shell.return_value = start_result
+
+        cmd_result = Mock()
+        cmd_result.stdout = ""
+        cmd_result.stderr = ""
+        cmd_result.exit_code = 0
+        cmd_result.error = None
+        cmd_result.status = SandboxStatus.SUCCESS
+        cmd_result.output_dir = None
+        cmd_result.stdout_file = None
+        cmd_result.stderr_file = None
+        cmd_result.truncated = False
+        cmd_result.original_stdout_length = None
+        cmd_result.original_stderr_length = None
+        sandbox.get_background_task_status.return_value = cmd_result
+
+        result = run_shell_command("true", agent_state=_make_agent_state(sandbox), ctx=FrameworkContext.for_testing())
+
+        assert result["content"] == "(empty)"
+        assert _format_shell_result(result) == "(empty)"
+
+    def test_nonzero_exit_formats_output_before_exit_code(self):
+        """Content fallback must not discard stdout/stderr on a failed command."""
+        sandbox = Mock()
+        sandbox.work_dir = Path("/tmp/work")
+        sandbox.prepare_shell_command.side_effect = lambda command: command
+
+        start_result = Mock()
+        start_result.background_pid = 123
+        sandbox.execute_shell.return_value = start_result
+
+        cmd_result = Mock()
+        cmd_result.stdout = "stdout body"
+        cmd_result.stderr = "stderr body"
+        cmd_result.exit_code = 7
+        cmd_result.error = None
+        cmd_result.status = SandboxStatus.ERROR
+        cmd_result.output_dir = None
+        cmd_result.stdout_file = None
+        cmd_result.stderr_file = None
+        cmd_result.truncated = False
+        cmd_result.original_stdout_length = None
+        cmd_result.original_stderr_length = None
+        sandbox.get_background_task_status.return_value = cmd_result
+
+        result = run_shell_command("failing-command", agent_state=_make_agent_state(sandbox), ctx=FrameworkContext.for_testing())
+
+        expected = "stdout body\nstderr body\nExit Code: 7"
+        assert result["content"] == expected
+        assert _format_shell_result(result) == expected
+
+    def test_background_start_formats_background_status(self):
+        """Background results should retain their dedicated formatter output."""
+        sandbox = Mock()
+        sandbox.work_dir = Path("/tmp/work")
+
+        cmd_result = Mock()
+        cmd_result.background_pid = 321
+        cmd_result.output_dir = "/tmp/out"
+        cmd_result.stdout_file = "/tmp/out/stdout.txt"
+        cmd_result.stderr_file = "/tmp/out/stderr.txt"
+        sandbox.execute_shell.return_value = cmd_result
+
+        result = run_shell_command(
+            "long-running-command",
+            is_background=True,
+            agent_state=_make_agent_state(sandbox),
+            ctx=FrameworkContext.for_testing(),
+        )
+
+        assert _format_shell_result(result) == (
+            "Command running in background with ID: 321. Output is being written to: /tmp/out/stdout.txt"
+        )
+
+    def test_dir_path_is_resolved_and_passed_as_cwd(self):
+        """RFC-0020: tool-layer cwd routing reaches the sandbox backend."""
+        sandbox = Mock()
+        sandbox.work_dir = Path("/tmp/work")
+        sandbox.file_exists.return_value = True
+        info = Mock()
+        info.is_directory = True
+        sandbox.get_file_info.return_value = info
+        sandbox.prepare_shell_command.side_effect = lambda command: command
+
+        start_result = Mock()
+        start_result.background_pid = 123
+        sandbox.execute_shell.return_value = start_result
+
+        cmd_result = Mock()
+        cmd_result.stdout = "cwd ok"
+        cmd_result.stderr = ""
+        cmd_result.exit_code = 0
+        cmd_result.error = None
+        cmd_result.status = SandboxStatus.SUCCESS
+        cmd_result.output_dir = None
+        cmd_result.stdout_file = None
+        cmd_result.stderr_file = None
+        cmd_result.truncated = False
+        cmd_result.original_stdout_length = None
+        cmd_result.original_stderr_length = None
+        sandbox.get_background_task_status.return_value = cmd_result
+
+        agent_state = _make_agent_state(sandbox)
+        ctx = FrameworkContext.for_testing()
+        result = run_shell_command("echo cwd", dir_path="subdir", agent_state=agent_state, ctx=ctx)
+
+        expected_cwd = str(Path(str(sandbox.work_dir)) / "subdir")
+        assert result["content"] == "cwd ok"
+        assert "stdout" not in result
+        assert "stderr" not in result
+        sandbox.file_exists.assert_called_once_with(expected_cwd)
+        sandbox.get_file_info.assert_called_once_with(expected_cwd)
+        sandbox.execute_shell.assert_called_once_with("echo cwd", timeout=1800000, background=True, cwd=expected_cwd)
+
+    @patch("nexau.archs.tool.builtin.shell_tools.run_shell_command.time.sleep", return_value=None)
+    @patch("nexau.archs.tool.builtin.shell_tools.run_shell_command.time.monotonic", side_effect=[0.0, 0.002, 0.002])
+    def test_timeout_kills_running_foreground_command(self, _monotonic_mock, _sleep_mock):
+        """RFC-0020: foreground timeout uses sandbox background-task kill path."""
+        sandbox = Mock()
+        sandbox.work_dir = Path("/tmp/work")
+        sandbox.file_exists.return_value = True
+        info = Mock()
+        info.is_directory = True
+        sandbox.get_file_info.return_value = info
+        sandbox.prepare_shell_command.side_effect = lambda command: command
+
+        start_result = Mock()
+        start_result.background_pid = 789
+        sandbox.execute_shell.return_value = start_result
+
+        running_result = Mock()
+        running_result.status = SandboxStatus.RUNNING
+        running_result.stdout = "partial"
+        running_result.stderr = ""
+        running_result.exit_code = -1
+        running_result.error = None
+        running_result.output_dir = "/tmp/out"
+        running_result.stdout_file = "/tmp/out/stdout.txt"
+        running_result.stderr_file = "/tmp/out/stderr.txt"
+        running_result.truncated = False
+        running_result.original_stdout_length = None
+        running_result.original_stderr_length = None
+        sandbox.get_background_task_status.return_value = running_result
+
+        agent_state = _make_agent_state(sandbox)
+        ctx = FrameworkContext.for_testing()
+        result = run_shell_command("sleep", timeout_ms=1, agent_state=agent_state, ctx=ctx)
+
+        sandbox.kill_background_task.assert_called_once_with(789)
+        assert result["timed_out"] is True
+        assert result["error"]["message"] == "Command timed out after 1ms"
+        expected = "Timeout: command timed out after 0.0 minutes.\nError: Command timed out after 1ms\nExit Code: -1"
+        assert result["content"] == expected
+        assert _format_shell_result(result) == expected
+
+    @patch("nexau.archs.tool.builtin.shell_tools.run_shell_command.time.sleep", return_value=None)
+    def test_stop_request_kills_running_foreground_command(self, _sleep_mock):
+        """Should kill the sandbox task when shutdown_event is set during polling."""
+        sandbox = Mock()
+        sandbox.work_dir = Path("/tmp/work")
+        sandbox.file_exists.return_value = True
+        info = Mock()
+        info.is_directory = True
+        sandbox.get_file_info.return_value = info
+        sandbox.prepare_shell_command.side_effect = lambda command: command
+
+        start_result = Mock()
+        start_result.background_pid = 456
+        sandbox.execute_shell.return_value = start_result
+
+        running_result = Mock()
+        running_result.status = SandboxStatus.RUNNING
+        running_result.stdout = "partial output"
+        running_result.stderr = ""
+        running_result.exit_code = -1
+        running_result.error = None
+        running_result.output_dir = "/tmp/out"
+        running_result.stdout_file = "/tmp/out/stdout.txt"
+        running_result.stderr_file = "/tmp/out/stderr.txt"
+        running_result.truncated = False
+        running_result.original_stdout_length = None
+        running_result.original_stderr_length = None
+
+        shutdown_event = threading.Event()
+
+        def _status_side_effect(pid: int):
+            assert pid == 456
+            shutdown_event.set()
+            return running_result
+
+        sandbox.get_background_task_status.side_effect = _status_side_effect
+
+        agent_state = _make_agent_state(sandbox)
+        ctx = FrameworkContext.for_testing(shutdown_event=shutdown_event)
+
+        result = run_shell_command("echo hello", agent_state=agent_state, ctx=ctx)
+
+        sandbox.kill_background_task.assert_called_once_with(456)
+        assert result["error"]["message"] == "Command interrupted by stop request"
+        assert "Interrupted: command stopped due to stop request." in result["content"]
+        assert result["returnDisplay"] == "partial output"
+        assert result["exit_code"] == -1
+        assert "stdout" not in result
+        assert "stderr" not in result
+        assert result["interrupted"] is True
+        assert result["timed_out"] is False
+        expected = "Interrupted: command stopped due to stop request.\nError: Command interrupted by stop request\nExit Code: -1"
+        assert result["content"] == expected
+        assert _format_shell_result(result) == expected

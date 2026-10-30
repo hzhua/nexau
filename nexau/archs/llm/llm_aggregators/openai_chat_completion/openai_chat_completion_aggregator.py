@@ -1,0 +1,795 @@
+"""OpenAI Chat Completions stream aggregator.
+
+Aggregates OpenAI ``ChatCompletionChunk`` events into a complete
+``ChatCompletion`` plus emits unified Event objects. Handles canonical
+OpenAI wire format plus extension fields used by OpenRouter / DeepSeek /
+Qwen / vLLM (``reasoning_content`` flat, ``reasoning_details`` structured,
+``reasoning`` flat — all routed through ``_extract_reasoning_delta``).
+
+⚠️ PARITY PROTOCOL: This module has a twin in
+``nexau/archs/main_sub/execution/llm_caller.py``
+(``OpenAIChatStreamAggregator``) that MUST stay in lock-step until
+RFC-0023 §阶段 ③ retires the twin. Any change to this module's parsing
+or emission logic requires:
+
+1. Run ``uv run pytest tests/aggregator_parity/`` before commit.
+2. If your change handles a new wire pattern (new field / event type /
+   provider extension), record a fixture via
+   ``tests/aggregator_parity/scripts/record_fixture.py``.
+3. If parity surfaces a divergence, fix the buggy side rather than xfail
+   — real Set A↔Set B drift = real production bug.
+
+See ``tests/aggregator_parity/README.md`` for the full protocol.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import uuid
+from collections.abc import Callable
+from datetime import datetime
+from typing import Literal, cast
+
+from openai.types.chat.chat_completion import (
+    ChatCompletion,
+)
+from openai.types.chat.chat_completion import (
+    Choice as ChatCompletionChoice,
+)
+from openai.types.chat.chat_completion import (
+    ChoiceLogprobs as ChatCompletionChoiceLogprobs,
+)
+from openai.types.chat.chat_completion_chunk import (
+    ChatCompletionChunk,
+    ChoiceDelta,
+    ChoiceDeltaToolCall,
+)
+from openai.types.chat.chat_completion_chunk import (
+    Choice as ChatCompletionChunkChoice,
+)
+from openai.types.chat.chat_completion_chunk import (
+    ChoiceLogprobs as ChatCompletionChunkChoiceLogprobs,
+)
+from openai.types.chat.chat_completion_message import ChatCompletionMessage
+from openai.types.chat.chat_completion_message_tool_call import (
+    ChatCompletionMessageToolCall,
+    ChatCompletionMessageToolCallUnion,
+)
+from openai.types.chat.chat_completion_message_tool_call import (
+    Function as ChatCompletionMessageToolCallFunction,
+)
+
+from ..events import (
+    Aggregator,
+    Event,
+    ModelCallFinishedEvent,
+    TextMessageContentEvent,
+    TextMessageEndEvent,
+    TextMessageStartEvent,
+    ThinkingTextMessageContentEvent,
+    ThinkingTextMessageEndEvent,
+    ThinkingTextMessageStartEvent,
+    ToolCallArgsEvent,
+    ToolCallEndEvent,
+    ToolCallStartEvent,
+)
+
+# Re-export types from OpenAI SDK for easy reuse
+# These match the Literal types used in OpenAI's type annotations
+FINISH_REASON_LITERAL = Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
+SERVICE_TIER_LITERAL = Literal["auto", "default", "flex", "scale", "priority"]
+
+
+def _noop_event_handler(_: Event) -> None:
+    """No-op event handler for non-first choices to avoid duplicate UI updates."""
+    return None
+
+
+_logger = logging.getLogger(__name__)
+
+
+_EMPTY_CONTENT_PLACEHOLDER = "[empty]"
+"""Substituted into ``content`` by ``_ChoiceAggregator.build()`` when the
+stream produced reasoning but no content/refusal/tool_calls.
+
+Kept short (~3 BPE tokens) so prompt-cache miss on next turn is minimal.
+Diagnostic context (the actual reasoning text) lives on the built
+``ChatCompletionMessage.reasoning_content`` field, not in the wire content.
+See ``docs/development/case-studies/2026-05-09-step-3.5-flash-pathologies.md``.
+"""
+
+
+class OpenAIChatCompletionAggregator(Aggregator[ChatCompletionChunk, ChatCompletion]):
+    """
+    Aggregates a stream of chat completion chunks into a complete response.
+
+    This class maintains state while aggregating chunks and provides reusability
+    through the clear() method.
+    """
+
+    def __init__(self, *, on_event: Callable[[Event], None], run_id: str) -> None:
+        self._on_event = on_event
+        self._run_id = run_id
+        self._choice_aggregators: dict[int, _ChoiceAggregator] = {}
+        # Initialize _value with empty ChatCompletion (minus choices which are built later)
+        self._value = ChatCompletion(
+            id="",
+            choices=[],  # Will be replaced in build()
+            created=0,
+            model="",
+            object="chat.completion",
+            service_tier=None,
+            system_fingerprint=None,
+            usage=None,
+        )
+
+    def aggregate(self, item: ChatCompletionChunk) -> None:
+        """
+        Aggregate a stream item.
+
+        Args:
+            item: A single chunk from the OpenAI chat completion stream
+        """
+        # Update metadata from the chunk
+        self._aggregate_metadata(item)
+
+        # Process each choice in the chunk
+        for choice in item.choices:
+            aggregator = self._choice_aggregators.setdefault(
+                choice.index,
+                _ChoiceAggregator(
+                    index=choice.index,
+                    message_id=self._value.id,
+                    on_event=self._on_event,
+                    run_id=self._run_id,
+                ),
+            )
+            aggregator.aggregate(choice)
+
+    def build(self) -> ChatCompletion:
+        """
+        Build the final chat completion object from aggregated chunks.
+
+        Returns:
+            The complete ChatCompletion object
+
+        Raises:
+            RuntimeError: If no valid chunks were received
+        """
+        # RFC-0023 §阶段 ② — emit per-call metadata BEFORE choice validation.
+        # If the stream only contained reasoning_content (DeepSeek + logprobs),
+        # _choice_aggregators may still be empty but the call did happen and
+        # downstream consumers (parity tests, agent_events_middleware) need
+        # the metadata. So fire the event first, then validate.
+        self._emit_metadata_event()
+
+        if not self._choice_aggregators or not self._value.id:
+            raise RuntimeError("Chat completion stream did not receive any valid chunks from OpenAI")
+
+        # Build final choices
+        ordered_indices = sorted(self._choice_aggregators)
+        built_choices: list[ChatCompletionChoice] = []
+        for idx in ordered_indices:
+            built_choices.append(self._choice_aggregators[idx].build())
+
+        # Update _value with final choices and return
+        self._value.choices = built_choices
+        return self._value.model_copy(deep=True)
+
+    def _emit_metadata_event(self) -> None:
+        """RFC-0023 §阶段 ② — emit ModelCallFinishedEvent once per call.
+
+        Token usage is owned by ``UsageUpdateEvent`` (canonical normalized form).
+        """
+        # finish_reason lives on the per-choice aggregator; first choice wins
+        # (matches Set B's selection of the first choice as canonical).
+        stop_reason: str | None = None
+        if self._choice_aggregators:
+            first = self._choice_aggregators[sorted(self._choice_aggregators)[0]]
+            stop_reason = first.finish_reason
+        self._on_event(
+            ModelCallFinishedEvent(
+                run_id=self._run_id,
+                message_id=self._value.id or "",
+                model_name=self._value.model or None,
+                model_call_id=self._value.id or None,
+                stop_reason=stop_reason,
+                timestamp=int(datetime.now().timestamp() * 1000),
+            )
+        )
+
+    def clear(self) -> None:
+        """
+        Reset the aggregator state for reuse.
+
+        This allows the aggregator to be reused for processing a new stream
+        without creating a new instance.
+        """
+        self._choice_aggregators.clear()
+        # Reset _value to initial state
+        self._value = ChatCompletion(
+            id="",
+            choices=[],
+            created=0,
+            model="",
+            object="chat.completion",
+            service_tier=None,
+            system_fingerprint=None,
+            usage=None,
+        )
+
+    def _aggregate_metadata(self, item: ChatCompletionChunk) -> None:
+        """Aggregate metadata from a chunk."""
+        if item.id and not self._value.id:
+            self._value.id = item.id
+
+        if item.created:
+            self._value.created = item.created
+
+        if item.model:
+            self._value.model = item.model
+
+        if item.service_tier:
+            self._value.service_tier = item.service_tier
+
+        if item.system_fingerprint:
+            self._value.system_fingerprint = item.system_fingerprint
+
+        if item.usage:
+            self._value.usage = item.usage
+
+
+class _ChoiceAggregator(Aggregator[ChatCompletionChunkChoice, ChatCompletionChoice]):
+    """
+    Aggregates a single choice within a chat completion stream.
+
+    Handles content, tool calls, and logging events for one choice.
+    """
+
+    def __init__(
+        self,
+        *,
+        index: int,
+        message_id: str,
+        on_event: Callable[[Event], None],
+        run_id: str,
+    ) -> None:
+        self._index = index
+        self._message_id = message_id
+        self._run_id = run_id
+        # Only emit events for the first choice to avoid duplicate UI updates
+        self._on_event = on_event if index == 0 else _noop_event_handler
+        self._tool_call_aggregators: dict[int, _ToolCallAggregator] = {}
+        # Initialize _value with empty ChatCompletionChoice
+        self._value = ChatCompletionChoice(
+            finish_reason="stop",
+            index=index,
+            message=ChatCompletionMessage(role="assistant", content=None, refusal=None, tool_calls=None),
+            logprobs=None,
+        )
+        self._started = False
+        # Thinking (reasoning_content) state — 非标准字段，部分 OpenAI-compatible 提供商使用
+        self._thinking_message_id: str | None = None
+        self._thinking_started = False
+        self._thinking_ended = False
+        # Retain reasoning text + details for build() (RFC-0023 §阶段 ③).
+        # Two parallel wire formats from OpenAI-compatible providers:
+        #   - reasoning_content (str): DeepSeek / Qwen / vLLM
+        #   - reasoning_details (list[dict]): OpenRouter
+        # Both are non-standard extensions of ChatCompletionMessage; we
+        # attach them to the built message via the SDK's pydantic
+        # ``model_extra`` (extra="allow" on the SDK's ConfiguredBaseModel).
+        self._reasoning_content_parts: list[str] = []
+        self._reasoning_details: list[dict[str, object]] = []
+
+    @property
+    def finish_reason(self) -> str | None:
+        """Public read-only accessor for ``ChatCompletionChoice.finish_reason``.
+
+        Used by the parent ``OpenAIChatCompletionAggregator`` to populate
+        ``ModelCallFinishedEvent.stop_reason`` without poking at the
+        protected ``_value`` attribute (pyright reportPrivateUsage).
+        """
+        return self._value.finish_reason
+
+    def aggregate(self, item: ChatCompletionChunkChoice) -> None:
+        """
+        Aggregate a chunk for this choice.
+
+        Args:
+            item: Choice data from a stream chunk
+        """
+        delta: ChoiceDelta = item.delta
+
+        # Emit message start event on first content (either text or tool calls)
+        if not self._started:
+            self._started = True
+            self._on_event(
+                TextMessageStartEvent(
+                    message_id=self._message_id,
+                    role="assistant",
+                    timestamp=int(datetime.now().timestamp() * 1000),
+                    run_id=self._run_id,
+                )
+            )
+
+        # Reasoning content — 非标准字段（实施标准），DeepSeek/Qwen/vLLM 等 provider 使用
+        # OpenAI SDK 将未知字段放入 model_extra（ChoiceDelta 配置 extra='allow'）
+        self._aggregate_reasoning(delta)
+
+        # Aggregate content
+        if delta.content:
+            # 收到正式内容意味着推理结束，先关闭 thinking message
+            self._end_thinking_if_needed()
+            self._value.message.content = (self._value.message.content or "") + delta.content
+            # Emit TextMessageContentEvent
+            self._on_event(
+                TextMessageContentEvent(
+                    message_id=self._message_id,
+                    delta=delta.content,
+                    timestamp=int(datetime.now().timestamp() * 1000),
+                )
+            )
+
+        # Aggregate refusal
+        if delta.refusal:
+            self._end_thinking_if_needed()
+            self._value.message.refusal = (self._value.message.refusal or "") + delta.refusal
+            self._on_event(
+                TextMessageContentEvent(
+                    message_id=self._message_id,
+                    delta=delta.refusal,
+                    timestamp=int(datetime.now().timestamp() * 1000),
+                )
+            )
+
+        # Aggregate tool calls
+        if delta.tool_calls:
+            self._end_thinking_if_needed()
+            for tool_delta in delta.tool_calls:
+                aggregator = self._tool_call_aggregators.setdefault(
+                    tool_delta.index,
+                    _ToolCallAggregator(
+                        on_event=self._on_event,
+                        parent_message_id=self._message_id,
+                    ),
+                )
+                aggregator.aggregate(tool_delta)
+
+        # Update finish reason
+        if item.finish_reason:
+            self._value.finish_reason = item.finish_reason
+
+        # Aggregate logprobs
+        if item.logprobs:
+            self._append_logprobs(item.logprobs)
+
+        # Emit message end event when choice is complete
+        if item.finish_reason is not None:
+            # 若 provider 只返回 reasoning_content 就结束（无正式内容），在此兜底关闭 thinking
+            self._end_thinking_if_needed()
+            # Ensure all tool calls have emitted their start+end events
+            for aggregator in self._tool_call_aggregators.values():
+                aggregator.ensure_ended()
+            self._on_event(
+                TextMessageEndEvent(
+                    message_id=self._message_id,
+                    timestamp=int(datetime.now().timestamp() * 1000),
+                )
+            )
+
+    def build(self) -> ChatCompletionChoice:
+        """
+        Build the final choice object.
+
+        Returns:
+            The complete ChatCompletionChoice object
+
+        Raises:
+            RuntimeError: If the stream produced absolutely nothing —
+            no content, no refusal, no tool calls, no reasoning. That
+            indicates the connection died before any payload arrived
+            and the caller should fail loudly.
+
+        Vendor-pathology guard: when the stream produced reasoning but no
+        ``content``/``refusal``/``tool_calls`` (Step / DeepSeek / Qwen
+        finishing with ``finish_reason in {stop, length}`` mid-thinking),
+        substitute :data:`_EMPTY_CONTENT_PLACEHOLDER` for ``content`` so
+        downstream consumers see a normal-shaped message. The full
+        reasoning text remains attached under ``reasoning_content`` for
+        Langfuse trace + UI thinking display. Without this substitution,
+        Anthropic / Gemini reject empty-content assistant messages with
+        HTTP 400 on the next turn (session resume / vendor failover),
+        and the user sees an empty agent response with no signal. See
+        ``docs/development/case-studies/2026-05-09-step-3.5-flash-pathologies.md``.
+        """
+        has_any_signal = (
+            self._value.message.content is not None
+            or self._value.message.refusal is not None
+            or self._tool_call_aggregators
+            or self._reasoning_content_parts
+            or self._reasoning_details
+        )
+        if not has_any_signal:
+            raise RuntimeError(f"Choice {self._index} was never aggregated with any content")
+
+        # Empty-payload substitution: reasoning was the only useful artifact.
+        # Replace empty/None content with the canonical placeholder so the
+        # built ChatCompletion is downstream-safe for serialization +
+        # next-turn LLM calls. (Reasoning_content is attached separately
+        # below — kept for trace/audit, dropped by serializer whitelists.)
+        if not self._value.message.content and self._value.message.refusal is None and not self._tool_call_aggregators:
+            self._value.message.content = _EMPTY_CONTENT_PLACEHOLDER
+
+        # Build final tool calls
+        built_tool_calls: list[ChatCompletionMessageToolCallUnion] = []
+        if self._tool_call_aggregators:
+            for idx in sorted(self._tool_call_aggregators):
+                built_tool_calls.append(self._tool_call_aggregators[idx].build())
+        # Set tool calls with type assertion to handle union type
+        self._value.message.tool_calls = built_tool_calls
+
+        # Attach reasoning fields (RFC-0023 §阶段 ③). ChatCompletionMessage
+        # is an OpenAI SDK Pydantic model with extra="allow", so non-standard
+        # provider extension fields ride along through model_dump and are
+        # picked up by ModelResponse.from_openai_message via getattr.
+        if self._reasoning_content_parts:
+            object.__setattr__(self._value.message, "reasoning_content", "".join(self._reasoning_content_parts))
+        if self._reasoning_details:
+            object.__setattr__(self._value.message, "reasoning_details", list(self._reasoning_details))
+
+        # Return the complete choice
+        return self._value.model_copy(deep=True)
+
+    def clear(self) -> None:
+        """Reset choice aggregator for reuse."""
+        self._tool_call_aggregators.clear()
+        # Reset _value to initial state
+        self._value = ChatCompletionChoice(
+            finish_reason="stop",
+            index=self._index,
+            message=ChatCompletionMessage(role="assistant", content=None, refusal=None, tool_calls=None),
+            logprobs=None,
+        )
+        self._started = False
+        self._thinking_message_id = None
+        self._thinking_started = False
+        self._thinking_ended = False
+        self._reasoning_content_parts.clear()
+        self._reasoning_details.clear()
+
+    def _extract_reasoning_delta(self, delta: ChoiceDelta) -> str:
+        """Pull a display-text delta out of ChoiceDelta.model_extra for thinking events.
+
+        Two independent wire formats may carry reasoning from an OpenAI-compatible provider
+        (neither typed by the SDK):
+
+        - ``reasoning_content`` — DeepSeek / Qwen / vLLM: a single aggregated string
+          (may also arrive as ``list[{text: ...}]`` which we flatten).
+        - ``reasoning_details`` — OpenRouter: a list of structured blocks (``reasoning.text``,
+          ``reasoning.summary``, ...) whose text may live under either ``text`` or ``summary``.
+          This function only extracts the display text for UI streaming; the original
+          structured list is preserved elsewhere for verbatim echo-back.
+        """
+        extra = delta.model_extra
+        if not extra:
+            return ""
+        parts: list[str] = []
+        # ``reasoning`` (bare flat key, no ``_content`` suffix) — Step / a few
+        # other OpenAI-compatible providers stream chain-of-thought under this
+        # key. Distinct from DeepSeek's ``reasoning_content`` and OpenRouter's
+        # structured ``reasoning_details``; all three coexist in the wild and
+        # we route every one through the same display-text extraction.
+        for key in ("reasoning", "reasoning_content", "reasoning_details"):
+            raw: object = cast(object, extra.get(key))
+            if isinstance(raw, str):
+                parts.append(raw)
+            elif isinstance(raw, list):
+                entries = cast(list[object], raw)
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        entry_dict = cast(dict[str, object], entry)
+                        for text_key in ("text", "summary"):
+                            value = entry_dict.get(text_key)
+                            if isinstance(value, str) and value:
+                                parts.append(value)
+        return "".join(parts)
+
+    def _aggregate_reasoning(self, delta: ChoiceDelta) -> None:
+        """Emit Thinking* events for reasoning_content deltas."""
+        # Retain raw reasoning fields for build() (RFC-0023 §阶段 ③).
+        extra = delta.model_extra or {}
+        # Bare ``reasoning`` (Step) — store under the same canonical
+        # ``reasoning_content`` slot on the built message. Downstream
+        # consumers (UI, persistence, ModelResponse) only know about
+        # ``reasoning_content``; we don't fork the schema per vendor.
+        bare_reasoning = extra.get("reasoning")
+        if isinstance(bare_reasoning, str) and bare_reasoning:
+            self._reasoning_content_parts.append(bare_reasoning)
+        rc_raw = extra.get("reasoning_content")
+        if isinstance(rc_raw, str) and rc_raw:
+            self._reasoning_content_parts.append(rc_raw)
+        elif isinstance(rc_raw, list):
+            # DeepSeek/Qwen sometimes ship reasoning_content as a list of
+            # ``{text: ...}`` blocks. Flatten the text into the running string
+            # to mirror Set B's behavior, but ALSO preserve the structured
+            # list under reasoning_details if needed downstream.
+            for item in cast(list[object], rc_raw):
+                if isinstance(item, dict):
+                    text = cast(dict[str, object], item).get("text")
+                    if isinstance(text, str) and text:
+                        self._reasoning_content_parts.append(text)
+        rd_raw = extra.get("reasoning_details")
+        if isinstance(rd_raw, list):
+            for item in cast(list[object], rd_raw):
+                if isinstance(item, dict):
+                    self._reasoning_details.append(dict(cast(dict[str, object], item)))
+
+        reasoning_delta = self._extract_reasoning_delta(delta)
+        if not reasoning_delta:
+            return
+        if self._thinking_ended:
+            # 推理块已关闭后再收到 reasoning_content 属于 provider 异常，忽略即可
+            return
+        if not self._thinking_started:
+            self._thinking_started = True
+            self._thinking_message_id = str(uuid.uuid4())
+            self._on_event(
+                ThinkingTextMessageStartEvent(
+                    parent_message_id=self._message_id,
+                    thinking_message_id=self._thinking_message_id,
+                    run_id=self._run_id,
+                    timestamp=int(datetime.now().timestamp() * 1000),
+                )
+            )
+        assert self._thinking_message_id is not None
+        self._on_event(
+            ThinkingTextMessageContentEvent(
+                thinking_message_id=self._thinking_message_id,
+                delta=reasoning_delta,
+                timestamp=int(datetime.now().timestamp() * 1000),
+            )
+        )
+
+    def _end_thinking_if_needed(self) -> None:
+        """Close an open thinking message before real content/tool_calls/finish."""
+        if not self._thinking_started or self._thinking_ended:
+            return
+        assert self._thinking_message_id is not None
+        self._thinking_ended = True
+        self._on_event(
+            ThinkingTextMessageEndEvent(
+                thinking_message_id=self._thinking_message_id,
+                timestamp=int(datetime.now().timestamp() * 1000),
+            )
+        )
+
+    def _append_logprobs(self, chunk_logprobs: ChatCompletionChunkChoiceLogprobs) -> None:
+        """Append logprobs from a chunk to the aggregated logprobs."""
+        if self._value.logprobs is None:
+            self._value.logprobs = ChatCompletionChoiceLogprobs()
+
+        if chunk_logprobs.content:
+            if self._value.logprobs.content is None:
+                self._value.logprobs.content = []
+            self._value.logprobs.content.extend(chunk_logprobs.content)
+
+        if chunk_logprobs.refusal:
+            if self._value.logprobs.refusal is None:
+                self._value.logprobs.refusal = []
+            self._value.logprobs.refusal.extend(chunk_logprobs.refusal)
+
+
+class _ToolCallAggregator(Aggregator[ChoiceDeltaToolCall, ChatCompletionMessageToolCall]):
+    """
+    Aggregates a single tool call within a choice.
+
+    Handles tool call arguments and emits appropriate events.
+    """
+
+    def __init__(
+        self,
+        *,
+        on_event: Callable[[Event], None],
+        parent_message_id: str,
+    ) -> None:
+        self._on_event = on_event
+        self._parent_message_id = parent_message_id
+        self._value = ChatCompletionMessageToolCall(
+            id="", type="function", function=ChatCompletionMessageToolCallFunction(name="", arguments="")
+        )
+        self._started = False
+        self._ended = False
+        self._json_state: Literal["init", "in_object", "complete"] = "init"
+        # Args deltas accumulated while waiting for tool name to arrive.
+        # Some providers send id+arguments before name, in which case
+        # emitting ToolCallArgsEvent immediately leaves downstream
+        # consumers (live UI) seeing arguments for an unknown tool —
+        # they fall back to a placeholder name. We buffer these deltas
+        # and flush them as a single ToolCallArgsEvent right after the
+        # ToolCallStartEvent fires.
+        self._pending_args: list[str] = []
+
+    def aggregate(self, item: ChoiceDeltaToolCall) -> None:
+        """
+        Aggregate a tool call item.
+
+        Args:
+            delta: Tool call data from a stream chunk
+        """
+        fn_args = None
+        if item.function and item.function.arguments:
+            raw = item.function.arguments
+            fn_args = (raw[:80] + "...") if len(raw) > 80 else raw
+        _logger.debug(
+            "tool_call_chunk id=%s index=%s type=%s fn.name=%s fn.args=%s accumulated_id=%s accumulated_name=%s started=%s",
+            item.id,
+            item.index,
+            item.type,
+            item.function.name if item.function else None,
+            fn_args,
+            self._value.id,
+            self._value.function.name,
+            self._started,
+        )
+
+        # Accumulate tool call ID and type first
+        if item.id:
+            self._value.id = item.id
+
+        if item.type:
+            self._value.type = item.type
+
+        # Aggregate function data
+        if item.function:
+            fn = item.function
+
+            # Emit tool call start event once we have ID and name
+            # Check both current chunk name and accumulated name for cases where
+            # name arrives in a different chunk than id
+            if not self._started and self._value.id and (fn.name or self._value.function.name):
+                self._started = True
+                effective_name = fn.name or self._value.function.name
+                self._on_event(
+                    ToolCallStartEvent(
+                        tool_call_id=self._value.id,
+                        tool_call_name=effective_name,
+                        parent_message_id=self._parent_message_id,
+                        timestamp=int(datetime.now().timestamp() * 1000),
+                    )
+                )
+                # 之前缓存的 args delta（在 START 之前到达的 id+arguments
+                # chunk）一次性补发，保持事件流"START → ARGS …"顺序。
+                if self._pending_args:
+                    flushed = "".join(self._pending_args)
+                    self._pending_args.clear()
+                    self._on_event(
+                        ToolCallArgsEvent(
+                            tool_call_id=self._value.id,
+                            delta=flushed,
+                            timestamp=int(datetime.now().timestamp() * 1000),
+                        )
+                    )
+
+            if fn.name:
+                self._value.function.name = fn.name
+
+            if fn.arguments:
+                self._value.function.arguments += fn.arguments
+                if self._started:
+                    # 正常路径：name 已知，直接发 ARGS。
+                    self._on_event(
+                        ToolCallArgsEvent(
+                            tool_call_id=self._value.id,
+                            delta=fn.arguments,
+                            timestamp=int(datetime.now().timestamp() * 1000),
+                        )
+                    )
+                else:
+                    # name 还没到（部分 provider 把 name 放在后续 chunk）。
+                    # 缓存 delta，等 START 发出时一起 flush。
+                    self._pending_args.append(fn.arguments)
+                # Update JSON state regardless — tracks bracket-balanced JSON
+                # against the accumulated `_value.function.arguments`.
+                self._update_json_state()
+
+        # Emit tool call end event once when JSON is complete AND start was emitted
+        if self._json_state == "complete" and self._started and not self._ended:
+            self._ended = True
+            self._on_event(
+                ToolCallEndEvent(
+                    tool_call_id=self._value.id,
+                    timestamp=int(datetime.now().timestamp() * 1000),
+                )
+            )
+
+    def ensure_ended(self) -> None:
+        """Ensure ToolCallEndEvent is emitted for this tool call.
+
+        Called by the parent ChoiceAggregator when finish_reason is received,
+        to guarantee the frontend always gets a paired end event.
+        If ToolCallStartEvent was never emitted (e.g. name arrived late or
+        never arrived at all for some model providers), emit it first using
+        the accumulated name or 'unknown' as fallback.
+        """
+        if not self._started and self._value.id:
+            self._started = True
+            effective_name = self._value.function.name or "unknown"
+            _logger.warning(
+                "ensure_ended: emitting late TOOL_CALL_START id=%s name=%s accumulated_args_len=%d",
+                self._value.id,
+                effective_name,
+                len(self._value.function.arguments),
+            )
+            self._on_event(
+                ToolCallStartEvent(
+                    tool_call_id=self._value.id,
+                    tool_call_name=effective_name,
+                    parent_message_id=self._parent_message_id,
+                    timestamp=int(datetime.now().timestamp() * 1000),
+                )
+            )
+            # 兜底路径下 args 通常已通过缓存累积；START 后一次性补发。
+            if self._pending_args:
+                flushed = "".join(self._pending_args)
+                self._pending_args.clear()
+                self._on_event(
+                    ToolCallArgsEvent(
+                        tool_call_id=self._value.id,
+                        delta=flushed,
+                        timestamp=int(datetime.now().timestamp() * 1000),
+                    )
+                )
+        if self._started and not self._ended:
+            self._ended = True
+            self._on_event(
+                ToolCallEndEvent(
+                    tool_call_id=self._value.id,
+                    timestamp=int(datetime.now().timestamp() * 1000),
+                )
+            )
+
+    def _update_json_state(self) -> None:
+        """Update JSON state by trying to parse the accumulated arguments.
+
+        This method checks if the accumulated arguments form a valid JSON object.
+        """
+
+        try:
+            if self._value.function.arguments.strip():
+                json.loads(self._value.function.arguments)
+                self._json_state = "complete"
+            else:
+                self._json_state = "init"
+        except (json.JSONDecodeError, ValueError):
+            self._json_state = "in_object"
+
+    def build(self) -> ChatCompletionMessageToolCall:
+        """
+        Build the final tool call object.
+
+        Returns:
+            The complete ChatCompletionMessageToolCall object
+
+        Raises:
+            ValueError: If called without receiving valid tool call data
+        """
+        if not self._started or not self._value.id or not self._value.function.name:
+            raise ValueError(
+                f"Tool call aggregator never received valid tool call data (ID={self._value.id}, name={self._value.function.name})"
+            )
+
+        # Return complete tool call
+        return self._value.model_copy(deep=True)
+
+    def clear(self) -> None:
+        """Reset tool call aggregator for reuse."""
+        self._value = ChatCompletionMessageToolCall(
+            id="", type="function", function=ChatCompletionMessageToolCallFunction(name="", arguments="")
+        )
+        self._started = False
+        self._ended = False
+        # Reset JSON tracking
+        self._json_state = "init"
+        # Note: _parent_message_id is intentionally not reset as it's a constant reference

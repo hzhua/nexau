@@ -1,0 +1,1768 @@
+# Copyright (c) Nex-AGI. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Unit tests for OpenAI chat completion aggregator.
+"""
+
+from typing import Literal
+from unittest.mock import Mock
+
+import pytest
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import (
+    Choice as ChatCompletionChunkChoice,
+)
+from openai.types.chat.chat_completion_chunk import (
+    ChoiceDelta,
+    ChoiceDeltaToolCall,
+    ChoiceDeltaToolCallFunction,
+)
+
+from nexau.archs.llm.llm_aggregators import OpenAIChatCompletionAggregator
+from nexau.archs.llm.llm_aggregators.openai_chat_completion.openai_chat_completion_aggregator import _ToolCallAggregator
+
+_FinishReasonLiteral = Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
+
+
+class TestOpenAIChatCompletionAggregator:
+    """Test cases for OpenAI chat completion aggregator."""
+
+    def test_aggregator_initialization(self):
+        """Test aggregator initialization."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        assert aggregator._on_event == mock_on_event
+        assert aggregator._choice_aggregators == {}
+        assert aggregator._value.id == ""
+        assert aggregator._value.created == 0
+        assert aggregator._value.model == ""
+        assert aggregator._value.service_tier is None
+        assert aggregator._value.system_fingerprint is None
+        assert aggregator._value.usage is None
+
+    def test_aggregate_single_content_chunk(self):
+        """Test aggregating a single content chunk."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        chunk = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(role="assistant", content="Hello"),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk)
+
+        # Check metadata
+        assert aggregator._value.id == "chatcmpl-123"
+        assert aggregator._value.created == 1234567890
+        assert aggregator._value.model == "gpt-4o-mini"
+
+        # Check choice aggregator was created
+        assert 0 in aggregator._choice_aggregators
+
+    def test_aggregate_multiple_content_chunks(self):
+        """Test aggregating multiple content chunks."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        chunk1 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(role="assistant", content="Hello"),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        chunk2 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(content=" World!"),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk1)
+        aggregator.aggregate(chunk2)
+
+        result = aggregator.build()
+
+        assert result.id == "chatcmpl-123"
+        assert len(result.choices) == 1
+        assert result.choices[0].message.content == "Hello World!"
+        assert result.choices[0].finish_reason == "stop"
+
+        # Verify TextMessageContentEvent was also emitted
+        content_events = [call for call in mock_on_event.call_args_list if call[0][0].__class__.__name__ == "TextMessageContentEvent"]
+        assert len(content_events) == 2  # One for "Hello", one for " World!"
+        for event_call in content_events:
+            event = event_call[0][0]
+            assert event.message_id == "chatcmpl-123"
+            assert event.delta in ["Hello", " World!"]
+            assert event.timestamp is not None  # timestamp should be set
+
+    def test_aggregate_with_tool_calls(self):
+        """Test aggregating chunks with tool calls."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        chunk1 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(
+                        role="assistant",
+                        tool_calls=[
+                            ChoiceDeltaToolCall(
+                                index=0,
+                                id="call_abc123",
+                                function=ChoiceDeltaToolCallFunction(name="get_weather", arguments=""),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        chunk2 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(
+                        tool_calls=[
+                            ChoiceDeltaToolCall(
+                                index=0,
+                                function=ChoiceDeltaToolCallFunction(arguments='{"location": "Beijing"}'),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk1)
+        aggregator.aggregate(chunk2)
+
+        result = aggregator.build()
+
+        assert len(result.choices) == 1
+        choice = result.choices[0]
+        assert choice.message.tool_calls is not None
+        assert len(choice.message.tool_calls) == 1
+        tool_call = choice.message.tool_calls[0]
+        assert tool_call.id == "call_abc123"
+        assert tool_call.function.name == "get_weather"
+        assert tool_call.function.arguments == '{"location": "Beijing"}'
+
+    def test_clear_resets_state(self):
+        """Test that clear() resets aggregator state."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        chunk = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(role="assistant", content="Hello"),
+                    finish_reason="stop",
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk)
+        aggregator.clear()
+
+        assert aggregator._choice_aggregators == {}
+        assert aggregator._value.id == ""
+        assert aggregator._value.created == 0
+        assert aggregator._value.model == ""
+        assert aggregator._value.service_tier is None
+        assert aggregator._value.system_fingerprint is None
+        assert aggregator._value.usage is None
+
+    def test_aggregation_with_different_finish_reasons(self):
+        """Test aggregating chunks with different finish reasons."""
+        finish_reasons = ["stop", "length", "tool_calls", "content_filter", "function_call"]
+
+        for reason in finish_reasons:
+            mock_on_event = Mock()
+            aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+            chunk = ChatCompletionChunk(
+                id="chatcmpl-123",
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=0,
+                        delta=ChoiceDelta(role="assistant", content="Hello"),
+                        finish_reason=reason,
+                    )
+                ],
+                created=1234567890,
+                model="gpt-4o-mini",
+                object="chat.completion.chunk",
+            )
+
+            aggregator.aggregate(chunk)
+            result = aggregator.build()
+
+            assert result.choices[0].finish_reason == reason
+
+    def test_aggregation_with_refusal(self):
+        """Test aggregating chunks with refusal content."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        chunk1 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(role="assistant", content=None, refusal="I cannot"),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        chunk2 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(refusal=" answer that."),
+                    finish_reason="stop",
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk1)
+        aggregator.aggregate(chunk2)
+        result = aggregator.build()
+
+        assert result.choices[0].message.refusal == "I cannot answer that."
+
+    def test_aggregation_with_system_fingerprint(self):
+        """Test aggregating chunks with system fingerprint."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        chunk = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(role="assistant", content="Hello"),
+                    finish_reason="stop",
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            system_fingerprint="fp_abc123",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk)
+        result = aggregator.build()
+
+        assert result.system_fingerprint == "fp_abc123"
+
+    def test_aggregation_with_usage(self):
+        """Test aggregating chunks with usage statistics."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        from openai.types.completion_usage import CompletionUsage
+
+        chunk = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(role="assistant", content="Hello"),
+                    finish_reason="stop",
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            usage=CompletionUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk)
+        result = aggregator.build()
+
+        assert result.usage is not None
+        assert result.usage.prompt_tokens == 10
+        assert result.usage.completion_tokens == 5
+        assert result.usage.total_tokens == 15
+
+    def test_aggregation_multiple_tool_calls(self):
+        """Test aggregating multiple tool calls in different chunks."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        # First chunk with first tool call
+        chunk1 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(
+                        role="assistant",
+                        tool_calls=[
+                            ChoiceDeltaToolCall(
+                                index=0,
+                                id="call_abc123",
+                                function=ChoiceDeltaToolCallFunction(name="get_weather", arguments='{"location": "Beijing"}'),
+                            ),
+                            ChoiceDeltaToolCall(
+                                index=1,
+                                id="call_def456",
+                                function=ChoiceDeltaToolCallFunction(name="get_time", arguments='{"tz": "Asia/Shanghai"}'),
+                            ),
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk1)
+        result = aggregator.build()
+
+        # Verify two tool calls
+        assert result.choices[0].message.tool_calls is not None
+        assert len(result.choices[0].message.tool_calls) >= 1
+
+    def test_build_without_valid_chunks_raises_error(self):
+        """Test that build() raises RuntimeError when no valid chunks were received."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        # Try to build without aggregating any chunks
+        with pytest.raises(RuntimeError, match="Chat completion stream did not receive any valid chunks"):
+            aggregator.build()
+
+    def test_aggregation_with_logprobs(self):
+        """Test aggregating chunks with logprobs content."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        from openai.types.chat.chat_completion_chunk import ChoiceLogprobs
+        from openai.types.chat.chat_completion_token_logprob import ChatCompletionTokenLogprob
+
+        chunk1 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(role="assistant", content="Hello"),
+                    finish_reason=None,
+                    logprobs=ChoiceLogprobs(
+                        content=[ChatCompletionTokenLogprob(token="Hello", logprob=-0.5, bytes=[72, 101, 108, 108, 111], top_logprobs=[])]
+                    ),
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        chunk2 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(content=" World!"),
+                    finish_reason=None,
+                    logprobs=ChoiceLogprobs(
+                        content=[
+                            ChatCompletionTokenLogprob(
+                                token=" World!", logprob=-0.7, bytes=[32, 87, 111, 114, 108, 100, 33], top_logprobs=[]
+                            )
+                        ]
+                    ),
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk1)
+        aggregator.aggregate(chunk2)
+        result = aggregator.build()
+
+        # Verify logprobs were aggregated
+        logprobs = result.choices[0].logprobs
+        assert logprobs is not None
+        assert logprobs.content is not None
+        assert len(logprobs.content) == 2
+        assert logprobs.content[0].token == "Hello"
+        assert logprobs.content[1].token == " World!"
+
+    def test_aggregation_with_refusal_logprobs(self):
+        """Test aggregating chunks with refusal logprobs."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        from openai.types.chat.chat_completion_chunk import ChoiceLogprobs
+        from openai.types.chat.chat_completion_token_logprob import ChatCompletionTokenLogprob
+
+        chunk1 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(role="assistant", content=None, refusal="I cannot"),
+                    finish_reason=None,
+                    logprobs=ChoiceLogprobs(
+                        refusal=[
+                            ChatCompletionTokenLogprob(token="I", logprob=-0.1, bytes=[73], top_logprobs=[]),
+                            ChatCompletionTokenLogprob(
+                                token=" cannot", logprob=-0.2, bytes=[32, 99, 97, 110, 110, 111, 116], top_logprobs=[]
+                            ),
+                        ]
+                    ),
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        chunk2 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(refusal=" answer that."),
+                    finish_reason="stop",
+                    logprobs=ChoiceLogprobs(
+                        refusal=[
+                            ChatCompletionTokenLogprob(
+                                token=" answer", logprob=-0.3, bytes=[32, 97, 110, 115, 119, 101, 114], top_logprobs=[]
+                            ),
+                            ChatCompletionTokenLogprob(token=" that.", logprob=-0.4, bytes=[32, 116, 104, 97, 116, 46], top_logprobs=[]),
+                        ]
+                    ),
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk1)
+        aggregator.aggregate(chunk2)
+        result = aggregator.build()
+
+        # Verify refusal logprobs were aggregated
+        logprobs = result.choices[0].logprobs
+        assert logprobs is not None
+        assert logprobs.refusal is not None
+        assert len(logprobs.refusal) == 4
+
+    def test_multiple_tool_calls_with_argument_chunks(self):
+        """Test aggregating multiple tool calls where arguments arrive in multiple chunks."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        # First chunk: tool call 0 with initial arguments
+        chunk1 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(
+                        role="assistant",
+                        tool_calls=[
+                            ChoiceDeltaToolCall(
+                                index=0,
+                                id="call_abc123",
+                                function=ChoiceDeltaToolCallFunction(name="get_weather", arguments='{"location":'),
+                            ),
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        # Second chunk: continue tool call 0 arguments
+        chunk2 = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(
+                        tool_calls=[
+                            ChoiceDeltaToolCall(
+                                index=0,
+                                function=ChoiceDeltaToolCallFunction(arguments=' "Beijing"}'),
+                            ),
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk1)
+        aggregator.aggregate(chunk2)
+        result = aggregator.build()
+
+        # Verify tool call arguments were aggregated correctly
+        assert result.choices[0].message.tool_calls is not None
+        assert len(result.choices[0].message.tool_calls) >= 1
+        tool_call = result.choices[0].message.tool_calls[0]
+        assert tool_call.id == "call_abc123"
+        assert tool_call.function.name == "get_weather"
+        assert tool_call.function.arguments == '{"location": "Beijing"}'
+
+        # Verify that ToolCallStartEvent was emitted with parent_message_id
+        tool_call_start_events = [call for call in mock_on_event.call_args_list if call[0][0].__class__.__name__ == "ToolCallStartEvent"]
+        assert len(tool_call_start_events) >= 1
+        for event_call in tool_call_start_events:
+            event = event_call[0][0]
+            assert event.tool_call_id == "call_abc123"
+            assert event.tool_call_name == "get_weather"
+            assert event.parent_message_id == "chatcmpl-123"
+            assert event.timestamp is not None  # timestamp should be set
+
+        # Verify ToolCallArgsEvent was emitted (for compatibility)
+        tool_call_args_events = [call for call in mock_on_event.call_args_list if call[0][0].__class__.__name__ == "ToolCallArgsEvent"]
+        assert len(tool_call_args_events) >= 1
+        for event_call in tool_call_args_events:
+            event = event_call[0][0]
+            assert event.tool_call_id == "call_abc123"
+            assert event.timestamp is not None  # timestamp should be set
+            # Verify that delta contains the arguments
+            assert event.delta in ['{"location":', ' "Beijing"}']
+
+    def test_aggregation_with_service_tier(self):
+        """Test aggregating chunks with service tier information."""
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        chunk = ChatCompletionChunk(
+            id="chatcmpl-123",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(role="assistant", content="Hello"),
+                    finish_reason="stop",
+                )
+            ],
+            created=1234567890,
+            model="gpt-4o-mini",
+            service_tier="default",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk)
+        result = aggregator.build()
+
+        assert result.service_tier == "default"
+
+    def test_choice_aggregator_build_without_aggregation_raises_error(self):
+        """Test that ChoiceAggregator build() raises error when never aggregated."""
+        mock_on_event = Mock()
+
+        # Import the internal _ChoiceAggregator class for white-box testing
+        from nexau.archs.llm.llm_aggregators.openai_chat_completion.openai_chat_completion_aggregator import _ChoiceAggregator
+
+        aggregator = _ChoiceAggregator(index=0, message_id="msg-123", on_event=mock_on_event, run_id="test-run")
+
+        # Try to build without aggregating any content
+        with pytest.raises(RuntimeError, match="Choice 0 was never aggregated with any content"):
+            aggregator.build()
+
+    def test_choice_aggregator_clear_resets_state(self):
+        """Test that ChoiceAggregator clear() resets state."""
+        mock_on_event = Mock()
+
+        # Import the internal _ChoiceAggregator class for white-box testing
+        from nexau.archs.llm.llm_aggregators.openai_chat_completion.openai_chat_completion_aggregator import _ChoiceAggregator
+
+        aggregator = _ChoiceAggregator(index=0, message_id="msg-123", on_event=mock_on_event, run_id="test-run")
+
+        # Aggregate some content first
+        aggregator.aggregate(
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=ChoiceDelta(role="assistant", content="Hello"),
+                finish_reason=None,
+            )
+        )
+
+        # Clear should reset all state
+        aggregator.clear()
+
+        # Verify state is reset (using _value for all checks)
+        assert aggregator._value.message.content is None
+        assert aggregator._value.message.role == "assistant"
+        assert aggregator._value.message.refusal is None
+        assert aggregator._value.message.tool_calls is None
+        assert aggregator._value.finish_reason == "stop"
+        assert aggregator._value.logprobs is None
+        assert aggregator._tool_call_aggregators == {}
+
+    def test_tool_call_aggregator_build_without_start_raises_error(self):
+        """Test that ToolCallAggregator build() raises error when not started."""
+        mock_on_event = Mock()
+
+        aggregator = _ToolCallAggregator(on_event=mock_on_event, parent_message_id="msg-123")
+
+        # Don't aggregate anything, or aggregate without ID and name
+        from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceDeltaToolCallFunction
+
+        aggregator.aggregate(ChoiceDeltaToolCall(index=0, function=ChoiceDeltaToolCallFunction(arguments='{"test": true}')))
+
+        # Try to build without receiving ID and name
+        with pytest.raises(ValueError, match="Tool call aggregator never received valid tool call data"):
+            aggregator.build()
+
+    def test_tool_call_aggregator_clear_resets_state(self):
+        """Test that ToolCallAggregator clear() resets state."""
+        mock_on_event = Mock()
+
+        aggregator = _ToolCallAggregator(on_event=mock_on_event, parent_message_id="msg-123")
+
+        # First set up aggregator with valid data
+        from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall, ChoiceDeltaToolCallFunction
+
+        aggregator.aggregate(
+            ChoiceDeltaToolCall(
+                index=0, id="call_abc123", function=ChoiceDeltaToolCallFunction(name="get_weather", arguments='{"location": "Beijing"}')
+            )
+        )
+
+        # Clear should reset all state
+        aggregator.clear()
+
+        # Verify state is reset
+        assert aggregator._value.id == ""
+        assert aggregator._value.function.name == ""
+        assert aggregator._value.function.arguments == ""
+        assert not aggregator._started
+        assert aggregator._value.type == "function"
+        # Verify parent_message_id is preserved (not reset on clear)
+        assert aggregator._parent_message_id == "msg-123"
+
+    # ==================== Tests for DeepSeek/nex streaming behavior fixes ====================
+
+    def test_tool_call_split_id_and_name_across_chunks(self):
+        """Test that ToolCallStartEvent fires when id and name arrive in separate chunks.
+
+        DeepSeek-based models (e.g. nex-agi/deepseek-v3.1-nex-1) may send the tool call
+        id in one chunk and the function name in a subsequent chunk. The aggregator must
+        use the accumulated name (self._value.function.name) as fallback.
+        """
+        mock_on_event = Mock()
+        aggregator = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="test-run")
+
+        # Chunk 1: id arrives, but NO name yet
+        chunk1 = ChatCompletionChunk(
+            id="chatcmpl-split",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(
+                        role="assistant",
+                        tool_calls=[
+                            ChoiceDeltaToolCall(
+                                index=0,
+                                id="call_split_001",
+                                function=ChoiceDeltaToolCallFunction(name=None, arguments=""),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="nex-agi/deepseek-v3.1-nex-1",
+            object="chat.completion.chunk",
+        )
+
+        # Chunk 2: name arrives (no id this time)
+        chunk2 = ChatCompletionChunk(
+            id="chatcmpl-split",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(
+                        tool_calls=[
+                            ChoiceDeltaToolCall(
+                                index=0,
+                                function=ChoiceDeltaToolCallFunction(name="read_file", arguments=""),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="nex-agi/deepseek-v3.1-nex-1",
+            object="chat.completion.chunk",
+        )
+
+        # Chunk 3: arguments
+        chunk3 = ChatCompletionChunk(
+            id="chatcmpl-split",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(
+                        tool_calls=[
+                            ChoiceDeltaToolCall(
+                                index=0,
+                                function=ChoiceDeltaToolCallFunction(arguments='{"path": "main.py"}'),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            created=1234567890,
+            model="nex-agi/deepseek-v3.1-nex-1",
+            object="chat.completion.chunk",
+        )
+
+        # Chunk 4: finish
+        chunk4 = ChatCompletionChunk(
+            id="chatcmpl-split",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta(),
+                    finish_reason="tool_calls",
+                )
+            ],
+            created=1234567890,
+            model="nex-agi/deepseek-v3.1-nex-1",
+            object="chat.completion.chunk",
+        )
+
+        aggregator.aggregate(chunk1)
+        aggregator.aggregate(chunk2)
+        aggregator.aggregate(chunk3)
+        aggregator.aggregate(chunk4)
+
+        result = aggregator.build()
+
+        # Verify the tool call was built correctly
+        assert result.choices[0].message.tool_calls is not None
+        assert len(result.choices[0].message.tool_calls) == 1
+        tc = result.choices[0].message.tool_calls[0]
+        assert tc.id == "call_split_001"
+        assert tc.function.name == "read_file"
+        assert tc.function.arguments == '{"path": "main.py"}'
+
+        # Verify exactly one ToolCallStartEvent was emitted
+        start_events = [c for c in mock_on_event.call_args_list if c[0][0].__class__.__name__ == "ToolCallStartEvent"]
+        assert len(start_events) == 1
+        assert start_events[0][0][0].tool_call_id == "call_split_001"
+        assert start_events[0][0][0].tool_call_name == "read_file"
+
+        # Verify exactly one ToolCallEndEvent was emitted
+        end_events = [c for c in mock_on_event.call_args_list if c[0][0].__class__.__name__ == "ToolCallEndEvent"]
+        assert len(end_events) == 1
+        assert end_events[0][0][0].tool_call_id == "call_split_001"
+
+    def test_tool_call_name_in_first_chunk_with_id(self):
+        """Test the normal case: id and name arrive together in the first chunk (OpenAI behavior).
+
+        This ensures the split-chunk fix doesn't break the standard path.
+        """
+        mock_on_event = Mock()
+
+        aggregator = _ToolCallAggregator(on_event=mock_on_event, parent_message_id="msg-normal")
+
+        # Single chunk with both id and name
+        aggregator.aggregate(
+            ChoiceDeltaToolCall(
+                index=0,
+                id="call_normal_001",
+                function=ChoiceDeltaToolCallFunction(name="get_weather", arguments='{"city": "Tokyo"}'),
+            )
+        )
+
+        start_events = [c for c in mock_on_event.call_args_list if c[0][0].__class__.__name__ == "ToolCallStartEvent"]
+        assert len(start_events) == 1
+        assert start_events[0][0][0].tool_call_name == "get_weather"
+
+    def test_args_before_name_buffered_until_start(self):
+        """Args deltas arriving before the tool name must NOT be emitted
+        as ``ToolCallArgsEvent`` immediately — that leaves live consumers
+        (UI aggregators) seeing args for an unknown tool, which they
+        render with a placeholder name. Buffer them and flush right
+        after ``ToolCallStartEvent`` fires, preserving START → ARGS
+        order.
+
+        Reproduces the production bug observed on
+        trace_id=71bfa4941837b0ebbb3a03231dd78479 where a tool call
+        briefly rendered as ``'unknown'`` on the playground compare
+        panel before settling to its real name once persisted
+        run_actions caught up.
+
+        Fixture-driven: the chunk sequence lives in
+        ``tests/unit/fixtures/openai_chat/tool_call_args_before_name.sse``
+        as a tiny synthetic SSE stream — same parser as the parity
+        recordings, so we don't reinvent chunk construction.
+        """
+        from tests.unit._chat_fixture_runner import run_chat_fixture
+
+        events, response = run_chat_fixture("tool_call_args_before_name")
+
+        # 1. First tool-call event must be START (no ARGS leak before it).
+        tc_events = [e for e in events if e.__class__.__name__.startswith("ToolCall")]
+        assert tc_events, "expected at least one tool-call event"
+        assert tc_events[0].__class__.__name__ == "ToolCallStartEvent", (
+            f"first TC event was {tc_events[0].__class__.__name__}, expected ToolCallStartEvent — args delta leaked before START (the bug)"
+        )
+
+        # 2. Exactly one START with the right name + id.
+        start_events = [e for e in events if e.__class__.__name__ == "ToolCallStartEvent"]
+        assert len(start_events) == 1
+        assert start_events[0].tool_call_id == "call_buf_001"
+        assert start_events[0].tool_call_name == "read_file"
+
+        # 3. ARGS deltas reconstruct to the full original args string
+        #    (buffered chunk-1 fragment + chunk-2 fragment, in order).
+        args_events = [e for e in events if e.__class__.__name__ == "ToolCallArgsEvent"]
+        assert "".join(e.delta for e in args_events) == '{"path": "a.py"}'
+
+        # 4. Built response carries the fully-aggregated tool call —
+        #    persistence path was always correct; this is just a guard.
+        tool_calls = response.choices[0].message.tool_calls
+        assert tool_calls is not None and len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read_file"
+        assert tool_calls[0].function.arguments == '{"path": "a.py"}'
+
+    def test_parallel_tool_calls_one_args_before_name(self):
+        """Two parallel tool calls in the same response. Tool index=0 has
+        the args-before-name race; tool index=1 is well-formed.
+
+        Both must:
+        - emit exactly one START with the correct name (no 'unknown' leak),
+        - have their ARGS reconstruct to the full args string,
+        - end up in ``response.choices[0].message.tool_calls`` in the right
+          order.
+
+        Order of START emission is wire-order: tool 1's START fires in
+        chunk 1 (its name was present); tool 0's START is delayed until
+        chunk 2 when its name finally lands.
+        """
+        from tests.unit._chat_fixture_runner import run_chat_fixture
+
+        events, response = run_chat_fixture("parallel_tool_calls_one_args_before_name")
+
+        starts = [e for e in events if e.__class__.__name__ == "ToolCallStartEvent"]
+        # Two distinct tools, two distinct STARTs, both with real names.
+        assert len(starts) == 2
+        names_by_id = {e.tool_call_id: e.tool_call_name for e in starts}
+        assert names_by_id == {"call_clean": "calculator", "call_racy": "web_search"}
+
+        # No leaked 'unknown' anywhere.
+        assert all(e.tool_call_name != "unknown" for e in starts)
+
+        # Wire-order: clean fires first (name in chunk 1), racy second.
+        assert [s.tool_call_id for s in starts] == ["call_clean", "call_racy"]
+
+        # Args reconstruct per tool.
+        args_by_id: dict[str, str] = {}
+        for ev in events:
+            if ev.__class__.__name__ != "ToolCallArgsEvent":
+                continue
+            args_by_id[ev.tool_call_id] = args_by_id.get(ev.tool_call_id, "") + ev.delta
+        assert args_by_id["call_clean"] == '{"expr":"1+1"}'
+        assert args_by_id["call_racy"] == '{"q":"hello"}'
+
+        # Built response: same data, persisted view.
+        tool_calls = response.choices[0].message.tool_calls
+        assert tool_calls is not None
+        by_id = {tc.id: tc for tc in tool_calls}
+        assert by_id["call_clean"].function.name == "calculator"
+        assert by_id["call_clean"].function.arguments == '{"expr":"1+1"}'
+        assert by_id["call_racy"].function.name == "web_search"
+        assert by_id["call_racy"].function.arguments == '{"q":"hello"}'
+
+    def test_tool_call_name_arrives_in_chunk_3(self):
+        """Args arrive in chunk 1 AND chunk 2 before name lands in chunk 3.
+        The buffer must hold multiple fragments and concatenate them when
+        START finally fires — not just the last fragment.
+        """
+        from tests.unit._chat_fixture_runner import run_chat_fixture
+
+        events, response = run_chat_fixture("tool_call_name_arrives_in_chunk_3")
+
+        # First TC event must be START.
+        tc_events = [e for e in events if e.__class__.__name__.startswith("ToolCall")]
+        assert tc_events[0].__class__.__name__ == "ToolCallStartEvent"
+
+        starts = [e for e in events if e.__class__.__name__ == "ToolCallStartEvent"]
+        assert len(starts) == 1
+        assert starts[0].tool_call_name == "read_file"
+        assert starts[0].tool_call_id == "call_late"
+
+        # Concatenated ARGS must equal the full pre-flush + post-flush stream:
+        # chunk 1: '{"path' + chunk 2: '":"' + chunk 3: 'main.py"}'
+        args_events = [e for e in events if e.__class__.__name__ == "ToolCallArgsEvent"]
+        assert "".join(e.delta for e in args_events) == '{"path":"main.py"}'
+
+        tc = response.choices[0].message.tool_calls
+        assert tc is not None and len(tc) == 1
+        assert tc[0].function.name == "read_file"
+        assert tc[0].function.arguments == '{"path":"main.py"}'
+
+    def test_tool_call_no_name_until_finish_uses_unknown_fallback(self):
+        """If `function.name` never arrives in the stream, ``ensure_ended``
+        emits a late START with name='unknown' once ``finish_reason`` lands.
+        Buffered args still flush in order.
+
+        This documents the absolute worst-case behaviour — pre-fix the
+        args leaked one-by-one as 'unknown'-named events; post-fix they
+        buffer and emit cleanly together. We assert on the live event
+        stream only; ``aggregator.build()`` deliberately *raises* in this
+        case because a nameless tool call can't be persisted (you can't
+        invoke "function `''`" downstream). The 'unknown' fallback exists
+        purely so the live UI doesn't render half-baked state mid-stream.
+        """
+        from collections.abc import Callable
+        from pathlib import Path
+
+        from openai.types.chat import ChatCompletionChunk
+
+        from nexau.archs.llm.llm_aggregators import (
+            Event,
+            OpenAIChatCompletionAggregator,
+        )
+        from tests.aggregator_parity.sse_loader import _parse_sse_blocks
+
+        # Inline the loader because run_chat_fixture calls build() which
+        # would raise here. We need the events but expect build() to fail.
+        path = Path(__file__).resolve().parent / "fixtures" / "openai_chat" / "tool_call_no_name_until_finish.sse"
+        chunk_dicts = _parse_sse_blocks(path.read_text(encoding="utf-8"))
+        chunks = [ChatCompletionChunk.model_validate(d) for d in chunk_dicts]
+
+        events: list[Event] = []
+        capture: Callable[[Event], None] = events.append
+        agg = OpenAIChatCompletionAggregator(on_event=capture, run_id="test-run")
+        for chunk in chunks:
+            agg.aggregate(chunk)
+
+        starts = [e for e in events if e.__class__.__name__ == "ToolCallStartEvent"]
+        assert len(starts) == 1
+        # No real name was ever sent → fallback.
+        assert starts[0].tool_call_name == "unknown"
+        assert starts[0].tool_call_id == "call_noname"
+
+        # First tool-call-related event must still be START (not ARGS).
+        tc_events = [e for e in events if e.__class__.__name__.startswith("ToolCall")]
+        assert tc_events[0].__class__.__name__ == "ToolCallStartEvent"
+
+        # Args reconstruct.
+        args_events = [e for e in events if e.__class__.__name__ == "ToolCallArgsEvent"]
+        assert "".join(e.delta for e in args_events) == '{"a":1,"b":2}'
+
+        # Persistence boundary: build() refuses to materialise a nameless
+        # tool call. This is the right behaviour — a missing name is
+        # nondeterministic provider data, not something to persist as ''.
+        with pytest.raises(ValueError, match="never received valid tool call data"):
+            agg.build()
+
+    def test_tool_call_ended_flag_prevents_duplicate_end_events(self):
+        """Test that _ended flag prevents duplicate ToolCallEndEvent.
+
+        When JSON is complete, ToolCallEndEvent fires. Then when finish_reason arrives,
+        ensure_ended() is called — it must NOT emit a second ToolCallEndEvent.
+        """
+        mock_on_event = Mock()
+
+        aggregator = _ToolCallAggregator(on_event=mock_on_event, parent_message_id="msg-dup")
+
+        # Chunk with id + name + complete JSON args
+        aggregator.aggregate(
+            ChoiceDeltaToolCall(
+                index=0,
+                id="call_dup_001",
+                function=ChoiceDeltaToolCallFunction(name="write_file", arguments='{"path": "a.txt", "content": "hi"}'),
+            )
+        )
+
+        # At this point, JSON is complete → ToolCallEndEvent should have fired
+        end_events_before = [c for c in mock_on_event.call_args_list if c[0][0].__class__.__name__ == "ToolCallEndEvent"]
+        assert len(end_events_before) == 1
+
+        # Now simulate finish_reason arriving → ensure_ended() is called
+        aggregator.ensure_ended()
+
+        # Should still be exactly 1 end event (no duplicate)
+        end_events_after = [c for c in mock_on_event.call_args_list if c[0][0].__class__.__name__ == "ToolCallEndEvent"]
+        assert len(end_events_after) == 1
+
+    def test_ensure_ended_emits_late_start_and_end(self):
+        """Test ensure_ended() emits both start and end events for tool calls that never started.
+
+        Some model providers may send tool call data in a way that never triggers the
+        normal start condition. ensure_ended() must emit a late ToolCallStartEvent
+        (with accumulated name or 'unknown') followed by ToolCallEndEvent.
+        """
+        mock_on_event = Mock()
+
+        aggregator = _ToolCallAggregator(on_event=mock_on_event, parent_message_id="msg-late")
+
+        # Directly set internal state to simulate an edge case where id and name
+        # were accumulated but the start condition in aggregate() was never met
+        # (e.g. chunks arrived without item.function set).  This cannot be
+        # reproduced through normal aggregate() calls, hence the direct access.
+        aggregator._value.id = "call_late_001"
+        aggregator._value.function.name = "search"
+        aggregator._value.function.arguments = '{"q": "test"}'
+
+        # _started is still False — ensure_ended should emit both start + end
+        assert not aggregator._started
+        assert not aggregator._ended
+
+        aggregator.ensure_ended()
+
+        start_events = [c for c in mock_on_event.call_args_list if c[0][0].__class__.__name__ == "ToolCallStartEvent"]
+        end_events = [c for c in mock_on_event.call_args_list if c[0][0].__class__.__name__ == "ToolCallEndEvent"]
+
+        assert len(start_events) == 1
+        assert start_events[0][0][0].tool_call_id == "call_late_001"
+        assert start_events[0][0][0].tool_call_name == "search"
+
+        assert len(end_events) == 1
+        assert end_events[0][0][0].tool_call_id == "call_late_001"
+
+    def test_ensure_ended_uses_unknown_when_no_name(self):
+        """Test ensure_ended() falls back to 'unknown' when no function name was accumulated."""
+        mock_on_event = Mock()
+
+        aggregator = _ToolCallAggregator(on_event=mock_on_event, parent_message_id="msg-unknown")
+
+        # Directly set id without name — same rationale as
+        # test_ensure_ended_emits_late_start_and_end above.
+        aggregator._value.id = "call_noname_001"
+
+        aggregator.ensure_ended()
+
+        start_events = [c for c in mock_on_event.call_args_list if c[0][0].__class__.__name__ == "ToolCallStartEvent"]
+        assert len(start_events) == 1
+        assert start_events[0][0][0].tool_call_name == "unknown"
+
+    def test_ensure_ended_noop_when_already_ended(self):
+        """Test ensure_ended() is a no-op when tool call already ended normally."""
+        mock_on_event = Mock()
+
+        aggregator = _ToolCallAggregator(on_event=mock_on_event, parent_message_id="msg-noop")
+
+        # Normal flow: start + complete args → auto end
+        aggregator.aggregate(
+            ChoiceDeltaToolCall(
+                index=0,
+                id="call_noop_001",
+                function=ChoiceDeltaToolCallFunction(name="ls", arguments="{}"),
+            )
+        )
+
+        call_count_before = mock_on_event.call_count
+
+        # ensure_ended should do nothing
+        aggregator.ensure_ended()
+
+        assert mock_on_event.call_count == call_count_before
+
+    def test_ensure_ended_noop_when_no_id(self):
+        """Test ensure_ended() does nothing when no tool call id was ever received."""
+        mock_on_event = Mock()
+
+        aggregator = _ToolCallAggregator(on_event=mock_on_event, parent_message_id="msg-noid")
+
+        # No data at all
+        aggregator.ensure_ended()
+
+        # No events should be emitted
+        assert mock_on_event.call_count == 0
+
+    def test_full_stream_with_split_chunks_end_to_end(self):
+        """End-to-end test: full aggregation with split id/name chunks produces correct event sequence.
+
+        Verifies the complete event lifecycle:
+        TextMessageStart → ToolCallStart → ToolCallArgs → ToolCallEnd → TextMessageEnd
+        """
+        events: list = []
+        aggregator = OpenAIChatCompletionAggregator(on_event=lambda e: events.append(e), run_id="test-run")
+
+        chunks = [
+            # Chunk 1: id only
+            ChatCompletionChunk(
+                id="chatcmpl-e2e",
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=0,
+                        delta=ChoiceDelta(
+                            role="assistant",
+                            tool_calls=[
+                                ChoiceDeltaToolCall(
+                                    index=0, id="call_e2e_001", function=ChoiceDeltaToolCallFunction(name=None, arguments="")
+                                ),
+                            ],
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                created=1000,
+                model="nex-agi/deepseek-v3.1-nex-1",
+                object="chat.completion.chunk",
+            ),
+            # Chunk 2: name arrives
+            ChatCompletionChunk(
+                id="chatcmpl-e2e",
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=0,
+                        delta=ChoiceDelta(
+                            tool_calls=[
+                                ChoiceDeltaToolCall(index=0, function=ChoiceDeltaToolCallFunction(name="bash", arguments="")),
+                            ]
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                created=1000,
+                model="nex-agi/deepseek-v3.1-nex-1",
+                object="chat.completion.chunk",
+            ),
+            # Chunk 3: args part 1
+            ChatCompletionChunk(
+                id="chatcmpl-e2e",
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=0,
+                        delta=ChoiceDelta(
+                            tool_calls=[
+                                ChoiceDeltaToolCall(index=0, function=ChoiceDeltaToolCallFunction(arguments='{"cmd":')),
+                            ]
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                created=1000,
+                model="nex-agi/deepseek-v3.1-nex-1",
+                object="chat.completion.chunk",
+            ),
+            # Chunk 4: args part 2 (completes JSON)
+            ChatCompletionChunk(
+                id="chatcmpl-e2e",
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=0,
+                        delta=ChoiceDelta(
+                            tool_calls=[
+                                ChoiceDeltaToolCall(index=0, function=ChoiceDeltaToolCallFunction(arguments=' "ls -la"}')),
+                            ]
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                created=1000,
+                model="nex-agi/deepseek-v3.1-nex-1",
+                object="chat.completion.chunk",
+            ),
+            # Chunk 5: finish
+            ChatCompletionChunk(
+                id="chatcmpl-e2e",
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=0,
+                        delta=ChoiceDelta(),
+                        finish_reason="tool_calls",
+                    )
+                ],
+                created=1000,
+                model="nex-agi/deepseek-v3.1-nex-1",
+                object="chat.completion.chunk",
+            ),
+        ]
+
+        for chunk in chunks:
+            aggregator.aggregate(chunk)
+
+        result = aggregator.build()
+
+        # Verify built result
+        assert result.choices[0].message.tool_calls is not None
+        tc = result.choices[0].message.tool_calls[0]
+        assert tc.id == "call_e2e_001"
+        assert tc.function.name == "bash"
+        assert tc.function.arguments == '{"cmd": "ls -la"}'
+
+        # Verify event sequence
+        event_types = [type(e).__name__ for e in events]
+        assert event_types[0] == "TextMessageStartEvent"
+        assert "ToolCallStartEvent" in event_types
+        assert "ToolCallArgsEvent" in event_types
+        assert "ToolCallEndEvent" in event_types
+        assert event_types[-1] == "ModelCallFinishedEvent"
+        assert "TextMessageEndEvent" in event_types
+
+        # Verify exactly one start and one end for the tool call
+        tc_starts = [e for e in events if type(e).__name__ == "ToolCallStartEvent"]
+        tc_ends = [e for e in events if type(e).__name__ == "ToolCallEndEvent"]
+        assert len(tc_starts) == 1
+        assert len(tc_ends) == 1
+
+
+class TestReasoningContentStreaming:
+    """Coverage for _extract_reasoning_delta / _aggregate_reasoning / _end_thinking_if_needed.
+
+    reasoning_content is a non-standard field (DeepSeek/Qwen/vLLM 实施标准) carried on
+    ChoiceDelta.model_extra. The aggregator maps it to UMP ThinkingTextMessage events.
+    """
+
+    @staticmethod
+    def _make_chunk(
+        delta_kwargs: dict[str, object],
+        finish_reason: _FinishReasonLiteral | None = None,
+    ) -> ChatCompletionChunk:
+        # model_validate 绕过 mypy 对非声明字段（reasoning_content）的 **kwargs 校验，
+        # 同时仍然保留 pydantic 的 extra='allow' 行为，extras 会进入 model_extra。
+        return ChatCompletionChunk(
+            id="chatcmpl-reasoning",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=ChoiceDelta.model_validate(delta_kwargs),
+                    finish_reason=finish_reason,
+                )
+            ],
+            created=1700000000,
+            model="deepseek-reasoner",
+            object="chat.completion.chunk",
+        )
+
+    @staticmethod
+    def _events_of(mock: Mock, cls_name: str) -> list[object]:
+        return [c.args[0] for c in mock.call_args_list if c.args and c.args[0].__class__.__name__ == cls_name]
+
+    def test_reasoning_content_str_emits_start_and_content(self):
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-1")
+
+        agg.aggregate(self._make_chunk({"reasoning_content": "step 1"}))
+
+        starts = self._events_of(mock_on_event, "ThinkingTextMessageStartEvent")
+        contents = self._events_of(mock_on_event, "ThinkingTextMessageContentEvent")
+        ends = self._events_of(mock_on_event, "ThinkingTextMessageEndEvent")
+
+        assert len(starts) == 1
+        start = starts[0]
+        assert start.parent_message_id == "chatcmpl-reasoning"
+        assert start.thinking_message_id
+        assert start.run_id == "run-1"
+
+        assert len(contents) == 1
+        content = contents[0]
+        assert content.thinking_message_id == start.thinking_message_id
+        assert content.delta == "step 1"
+
+        assert ends == []
+
+    def test_reasoning_content_list_dict_text_concatenated(self):
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-2")
+
+        agg.aggregate(
+            self._make_chunk(
+                {"reasoning_content": [{"text": "first "}, {"text": "second"}]},
+            )
+        )
+
+        contents = self._events_of(mock_on_event, "ThinkingTextMessageContentEvent")
+        assert len(contents) == 1
+        assert contents[0].delta == "first second"
+
+    def test_reasoning_content_list_filters_invalid_entries(self):
+        """Non-dict entries, dicts without text, non-str text, empty-str text must be skipped."""
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-3")
+
+        reasoning = [
+            "bare-string-ignored",
+            {"text": "keep-me"},
+            {"text": 42},
+            {"text": ""},
+            {"other": "no-text-key"},
+            {"text": " tail"},
+        ]
+        agg.aggregate(self._make_chunk({"reasoning_content": reasoning}))
+
+        contents = self._events_of(mock_on_event, "ThinkingTextMessageContentEvent")
+        assert len(contents) == 1
+        assert contents[0].delta == "keep-me tail"
+
+    def test_reasoning_content_empty_list_emits_nothing(self):
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-4")
+
+        agg.aggregate(self._make_chunk({"reasoning_content": []}))
+
+        assert self._events_of(mock_on_event, "ThinkingTextMessageStartEvent") == []
+        assert self._events_of(mock_on_event, "ThinkingTextMessageContentEvent") == []
+
+    def test_reasoning_content_empty_string_emits_nothing(self):
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-5")
+
+        agg.aggregate(self._make_chunk({"reasoning_content": ""}))
+
+        assert self._events_of(mock_on_event, "ThinkingTextMessageStartEvent") == []
+
+    def test_reasoning_content_non_str_non_list_emits_nothing(self):
+        """e.g. provider returns reasoning_content=42 or a dict — must not crash or emit."""
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-6")
+
+        agg.aggregate(self._make_chunk({"reasoning_content": 42}))
+        agg.aggregate(self._make_chunk({"reasoning_content": {"nested": "dict"}}))
+
+        assert self._events_of(mock_on_event, "ThinkingTextMessageStartEvent") == []
+
+    def test_reasoning_content_absent_unrelated_extra_field(self):
+        """Extra fields other than reasoning_content must not trigger thinking events."""
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-7")
+
+        agg.aggregate(self._make_chunk({"something_else": "ignored"}))
+
+        assert self._events_of(mock_on_event, "ThinkingTextMessageStartEvent") == []
+
+    def test_reasoning_start_emitted_only_once_across_chunks(self):
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-8")
+
+        agg.aggregate(self._make_chunk({"reasoning_content": "a"}))
+        agg.aggregate(self._make_chunk({"reasoning_content": "b"}))
+        agg.aggregate(self._make_chunk({"reasoning_content": "c"}))
+
+        starts = self._events_of(mock_on_event, "ThinkingTextMessageStartEvent")
+        contents = self._events_of(mock_on_event, "ThinkingTextMessageContentEvent")
+        assert len(starts) == 1
+        assert [c.delta for c in contents] == ["a", "b", "c"]
+        tid = starts[0].thinking_message_id
+        assert all(c.thinking_message_id == tid for c in contents)
+
+    def test_reasoning_ignored_after_thinking_closed_by_content(self):
+        """Once real content closes thinking, late reasoning_content chunks must be dropped."""
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-9")
+
+        agg.aggregate(self._make_chunk({"reasoning_content": "pre"}))
+        agg.aggregate(self._make_chunk({"content": "real answer"}))
+        # Provider misbehaves: sends more reasoning after content started
+        agg.aggregate(self._make_chunk({"reasoning_content": "late"}))
+        agg.aggregate(self._make_chunk({}, finish_reason="stop"))
+
+        starts = self._events_of(mock_on_event, "ThinkingTextMessageStartEvent")
+        contents = self._events_of(mock_on_event, "ThinkingTextMessageContentEvent")
+        ends = self._events_of(mock_on_event, "ThinkingTextMessageEndEvent")
+
+        assert len(starts) == 1
+        assert [c.delta for c in contents] == ["pre"]
+        assert len(ends) == 1
+
+    def test_thinking_closed_on_finish_when_no_content(self):
+        """Reasoning-only stream closes thinking block on finish_reason."""
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-10")
+
+        agg.aggregate(self._make_chunk({"reasoning_content": "think only"}))
+        # Need at least one non-empty content/tool_calls for build(); emit finish with content
+        agg.aggregate(self._make_chunk({"content": "."}, finish_reason="stop"))
+
+        types_in_order = [c.args[0].__class__.__name__ for c in mock_on_event.call_args_list if c.args]
+        # Thinking end must precede TextMessageEnd
+        assert "ThinkingTextMessageEndEvent" in types_in_order
+        assert "TextMessageEndEvent" in types_in_order
+        assert types_in_order.index("ThinkingTextMessageEndEvent") < types_in_order.index("TextMessageEndEvent")
+
+    def test_thinking_closed_before_refusal(self):
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-11")
+
+        agg.aggregate(self._make_chunk({"reasoning_content": "considering"}))
+        agg.aggregate(self._make_chunk({"refusal": "I can't"}, finish_reason="stop"))
+
+        types_in_order = [c.args[0].__class__.__name__ for c in mock_on_event.call_args_list if c.args]
+        # Thinking end must fire before the first refusal TextMessageContentEvent
+        end_idx = types_in_order.index("ThinkingTextMessageEndEvent")
+        first_text_content_idx = types_in_order.index("TextMessageContentEvent")
+        assert end_idx < first_text_content_idx
+
+    def test_thinking_closed_before_tool_calls(self):
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-12")
+
+        agg.aggregate(self._make_chunk({"reasoning_content": "plan"}))
+        agg.aggregate(
+            self._make_chunk(
+                {
+                    "tool_calls": [
+                        ChoiceDeltaToolCall(
+                            index=0,
+                            id="call_1",
+                            function=ChoiceDeltaToolCallFunction(name="noop", arguments="{}"),
+                        )
+                    ]
+                },
+                finish_reason="tool_calls",
+            )
+        )
+
+        types_in_order = [c.args[0].__class__.__name__ for c in mock_on_event.call_args_list if c.args]
+        assert types_in_order.index("ThinkingTextMessageEndEvent") < types_in_order.index("ToolCallStartEvent")
+
+    def test_end_thinking_if_needed_noop_when_not_started(self):
+        """White-box: calling _end_thinking_if_needed without a started thinking block is a no-op."""
+        from nexau.archs.llm.llm_aggregators.openai_chat_completion.openai_chat_completion_aggregator import _ChoiceAggregator
+
+        mock_on_event = Mock()
+        choice_agg = _ChoiceAggregator(index=0, message_id="msg", on_event=mock_on_event, run_id="run-13")
+
+        choice_agg._end_thinking_if_needed()
+
+        assert self._events_of(mock_on_event, "ThinkingTextMessageEndEvent") == []
+
+    def test_end_thinking_if_needed_noop_when_already_ended(self):
+        """White-box: calling _end_thinking_if_needed twice emits exactly one end event."""
+        from nexau.archs.llm.llm_aggregators.openai_chat_completion.openai_chat_completion_aggregator import _ChoiceAggregator
+
+        mock_on_event = Mock()
+        choice_agg = _ChoiceAggregator(index=0, message_id="msg", on_event=mock_on_event, run_id="run-14")
+
+        # Start a thinking block via a reasoning chunk
+        choice_agg.aggregate(
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=ChoiceDelta(reasoning_content="x"),
+                finish_reason=None,
+            )
+        )
+        choice_agg._end_thinking_if_needed()
+        choice_agg._end_thinking_if_needed()
+
+        assert len(self._events_of(mock_on_event, "ThinkingTextMessageEndEvent")) == 1
+
+    def test_clear_resets_thinking_state(self):
+        """After clear(), a new reasoning chunk should produce a fresh Start event (new thinking_message_id)."""
+        from nexau.archs.llm.llm_aggregators.openai_chat_completion.openai_chat_completion_aggregator import _ChoiceAggregator
+
+        mock_on_event = Mock()
+        choice_agg = _ChoiceAggregator(index=0, message_id="msg", on_event=mock_on_event, run_id="run-15")
+
+        choice_agg.aggregate(
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=ChoiceDelta(reasoning_content="round1"),
+                finish_reason=None,
+            )
+        )
+        first_start = self._events_of(mock_on_event, "ThinkingTextMessageStartEvent")[0]
+
+        choice_agg.clear()
+        mock_on_event.reset_mock()
+
+        choice_agg.aggregate(
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=ChoiceDelta(reasoning_content="round2"),
+                finish_reason=None,
+            )
+        )
+        second_start = self._events_of(mock_on_event, "ThinkingTextMessageStartEvent")[0]
+
+        assert first_start.thinking_message_id != second_start.thinking_message_id
+
+    def test_non_first_choice_thinking_events_suppressed(self):
+        """_noop_event_handler covers line 61: non-first choices must not emit thinking events."""
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-16")
+
+        chunk = ChatCompletionChunk(
+            id="chatcmpl-multi",
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=1,
+                    delta=ChoiceDelta(reasoning_content="suppressed"),
+                    finish_reason=None,
+                )
+            ],
+            created=1700000000,
+            model="deepseek-reasoner",
+            object="chat.completion.chunk",
+        )
+        agg.aggregate(chunk)
+
+        assert self._events_of(mock_on_event, "ThinkingTextMessageStartEvent") == []
+        assert self._events_of(mock_on_event, "ThinkingTextMessageContentEvent") == []
+
+    def test_reasoning_details_list_dict_text_emits_content(self):
+        """reasoning_details is a provider alias for reasoning_content (e.g. OpenRouter).
+
+        Structured list entries carry a `text` field that must be surfaced as thinking deltas.
+        """
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-17")
+
+        agg.aggregate(
+            self._make_chunk(
+                {
+                    "reasoning_details": [
+                        {"type": "reasoning.text", "text": "plan "},
+                        {"type": "reasoning.text", "text": "phase"},
+                    ],
+                },
+            )
+        )
+
+        starts = self._events_of(mock_on_event, "ThinkingTextMessageStartEvent")
+        contents = self._events_of(mock_on_event, "ThinkingTextMessageContentEvent")
+        assert len(starts) == 1
+        assert len(contents) == 1
+        assert contents[0].delta == "plan phase"
+
+    def test_reasoning_details_str_shape_also_accepted(self):
+        """Some providers send reasoning_details as a bare string; treat it as reasoning text too."""
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-18")
+
+        agg.aggregate(self._make_chunk({"reasoning_details": "string-form"}))
+
+        contents = self._events_of(mock_on_event, "ThinkingTextMessageContentEvent")
+        assert len(contents) == 1
+        assert contents[0].delta == "string-form"
+
+    def test_reasoning_content_and_details_concatenated_same_chunk(self):
+        """If a provider emits both in one chunk, both texts are concatenated into one delta."""
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-19")
+
+        agg.aggregate(
+            self._make_chunk(
+                {
+                    "reasoning_content": "first ",
+                    "reasoning_details": [{"text": "second"}],
+                },
+            )
+        )
+
+        contents = self._events_of(mock_on_event, "ThinkingTextMessageContentEvent")
+        assert len(contents) == 1
+        assert contents[0].delta == "first second"
+
+    def test_reasoning_details_summary_type_text_surfaced(self):
+        """OpenRouter emits reasoning.summary entries with a `summary` field instead of `text`."""
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-20")
+
+        agg.aggregate(
+            self._make_chunk(
+                {
+                    "reasoning_details": [
+                        {
+                            "type": "reasoning.summary",
+                            "summary": "Analyzed by decomposition",
+                            "id": "reasoning-summary-1",
+                            "format": "anthropic-claude-v1",
+                            "index": 0,
+                        },
+                        {
+                            "type": "reasoning.text",
+                            "text": " then verified",
+                            "signature": None,
+                            "id": "reasoning-text-1",
+                            "format": "anthropic-claude-v1",
+                            "index": 1,
+                        },
+                    ],
+                },
+            )
+        )
+
+        contents = self._events_of(mock_on_event, "ThinkingTextMessageContentEvent")
+        assert len(contents) == 1
+        assert contents[0].delta == "Analyzed by decomposition then verified"
+
+    def test_bare_reasoning_field_emits_thinking_events(self):
+        """Step / step-3.5-flash uses ``delta.reasoning`` (no ``_content`` suffix).
+
+        Pre-fix the aggregator silently dropped these chunks: the production
+        crash on trace ``42bce5e2baaf6eaf1528346392aa6062`` was 21 bare-
+        ``reasoning`` chunks → zero events surfaced → empty choice → RuntimeError.
+        Locks in the bare-key recognition path for that vendor wire shape.
+        """
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-step")
+        agg.aggregate(self._make_chunk({"reasoning": "想一下，"}))
+        agg.aggregate(self._make_chunk({"reasoning": "1+1=2 是数学公理"}))
+
+        contents = self._events_of(mock_on_event, "ThinkingTextMessageContentEvent")
+        assert [c.delta for c in contents] == ["想一下，", "1+1=2 是数学公理"]
+
+    def test_bare_reasoning_persisted_into_built_message_reasoning_content(self):
+        """Build() must surface bare ``reasoning`` chunks under the canonical
+        ``reasoning_content`` slot — downstream (UI, persistence,
+        ModelResponse.from_openai_message) only reads that one field, no
+        per-vendor schema fork.
+        """
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-step")
+        agg.aggregate(self._make_chunk({"reasoning": "first part"}))
+        agg.aggregate(self._make_chunk({"content": "answer"}))
+        agg.aggregate(self._make_chunk({"reasoning": " then more"}, finish_reason="stop"))
+
+        completion = agg.build()
+        choice = completion.choices[0]
+        assert choice.message.reasoning_content == "first part then more"  # type: ignore[attr-defined]
+
+    def test_reasoning_only_truncation_substitutes_placeholder(self):
+        """Reasoning-only stream (finish_reason=length, zero content tokens)
+        must (a) NOT raise ``Choice 0 was never aggregated with any content``
+        and (b) substitute ``[empty]`` placeholder for ``content`` so the
+        built message is wire-safe for next-turn calls.
+
+        Production repro: trace ``42bce5e2baaf6eaf1528346392aa6062`` crashed
+        agent_creator because step-3.5-flash truncated mid-thinking. Without
+        the placeholder, ``content=None`` propagates into history and breaks
+        Anthropic / Gemini (HTTP 400 on empty content) on session resume or
+        vendor failover. The reasoning text remains attached separately
+        under ``reasoning_content`` for trace / UI thinking display, and is
+        dropped from the wire by serializer whitelists.
+        """
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-step")
+        agg.aggregate(self._make_chunk({"reasoning": "thinking about it"}))
+        agg.aggregate(self._make_chunk({}, finish_reason="length"))
+
+        completion = agg.build()  # must not raise
+        choice = completion.choices[0]
+        assert choice.finish_reason == "length"
+        assert choice.message.content == "[empty]"
+        assert choice.message.reasoning_content == "thinking about it"  # type: ignore[attr-defined]
+
+    def test_xml_tool_call_in_reasoning_aggregates_as_reasoning_only(self):
+        """Step-3.5-flash multi-turn pathology — model embeds tool calls as
+        XML inside ``reasoning`` instead of using OpenAI ``tool_calls``.
+
+        Production trace 42bce5e2baaf6eaf1528346392aa6062 (agent_creator):
+        once the conversation has 3+ prior assistant tool turns, step-3.5-flash
+        deterministically (5/5 trials at temperature=0.2) emits the next tool
+        call as ``<function=NAME><parameter=...>...</tool_call>`` text inside
+        ``delta.reasoning`` and reports finish_reason=stop with empty content
+        and no ``tool_calls``. Prompt-engineering workarounds (anti-XML
+        system prompt, tool_choice=required, tool_choice={specific_tool},
+        temperature=0) all fail — it's a model-side bug.
+
+        Per discussion (顾乡 + 王晓星): we do NOT parse the embedded XML on
+        nexau's side. We just need the aggregator to surface the captured
+        reasoning text (so the UI shows what the model was trying to do)
+        instead of crashing or silently swallowing it. Locks that contract.
+        """
+        mock_on_event = Mock()
+        agg = OpenAIChatCompletionAggregator(on_event=mock_on_event, run_id="run-step")
+        # First chunk: role + empty content (real wire shape from Step)
+        agg.aggregate(self._make_chunk({"role": "assistant", "content": ""}))
+        # Then reasoning chunks containing the embedded XML tool call
+        for piece in [
+            "我应该用 run_shell_command 工具。",
+            "<function=run_shell_command>",
+            "<parameter=command>find /tmp -type d</parameter>",
+            "<parameter=description>list dirs</parameter>",
+            "</function>",
+            "</tool_call>",
+        ]:
+            agg.aggregate(self._make_chunk({"reasoning": piece}))
+        # Stream ends with finish_reason=stop, no usable tool_calls
+        agg.aggregate(self._make_chunk({}, finish_reason="stop"))
+
+        completion = agg.build()  # must not raise — reasoning IS payload
+        choice = completion.choices[0]
+        assert choice.finish_reason == "stop"
+        # Content gets substituted with placeholder so wire payload stays valid.
+        assert choice.message.content == "[empty]"
+        # No standard tool_calls because the model never emitted them.
+        assert not choice.message.tool_calls
+        # Reasoning preserved verbatim (UI / trace can show it; downstream
+        # callers can decide whether to retry / switch model / surface to user).
+        rc = choice.message.reasoning_content  # type: ignore[attr-defined]
+        assert "<function=run_shell_command>" in rc
+        assert "</tool_call>" in rc
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

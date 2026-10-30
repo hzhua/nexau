@@ -1,0 +1,976 @@
+# Copyright (c) Nex-AGI. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Comprehensive tests for the hooks module."""
+
+import logging
+
+import pytest
+
+from nexau.archs.main_sub.agent_context import AgentContext, GlobalStorage
+from nexau.archs.main_sub.agent_state import AgentState
+from nexau.archs.main_sub.execution.hooks import (
+    AfterAgentHookInput,
+    AfterModelHookInput,
+    AfterModelHookResult,
+    AfterToolHookInput,
+    AfterToolHookResult,
+    BeforeAgentHookInput,
+    BeforeModelHookInput,
+    BeforeModelHookResult,
+    BeforeToolHookInput,
+    FunctionMiddleware,
+    HookResult,
+    LoggingMiddleware,
+    Middleware,
+    MiddlewareManager,
+    ModelCallParams,
+    ToolCallParams,
+)
+from nexau.archs.main_sub.execution.model_response import ModelResponse
+from nexau.archs.main_sub.execution.parse_structures import (
+    ParsedResponse,
+    ToolCall,
+)
+from nexau.archs.main_sub.execution.stop_reason import AgentStopReason
+from nexau.archs.sandbox.local_sandbox import LocalSandbox
+from nexau.core.adapters.legacy import messages_from_legacy_openai_chat
+from nexau.core.messages import Message, Role, TextBlock
+
+
+@pytest.fixture
+def agent_state():
+    """Create a mock agent state for testing."""
+    from nexau.archs.tool.tool_registry import ToolRegistry
+
+    context = AgentContext()
+    global_storage = GlobalStorage()
+    return AgentState(
+        agent_name="test_agent",
+        agent_id="test_agent_id",
+        run_id="run_123",
+        root_run_id="run_123",
+        context=context,
+        global_storage=global_storage,
+        tool_registry=ToolRegistry(),
+    )
+
+
+@pytest.fixture
+def messages():
+    """Create sample messages for testing."""
+    return messages_from_legacy_openai_chat(
+        [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+            {"role": "user", "content": "How are you?"},
+        ],
+    )
+
+
+@pytest.fixture
+def parsed_response():
+    """Create a sample parsed response for testing."""
+    tool_call = ToolCall(
+        tool_name="test_tool",
+        parameters={"param1": "value1"},
+        raw_content="<tool>test</tool>",
+    )
+    sub_agent_call = ToolCall(
+        tool_name="Agent",
+        parameters={"sub_agent_name": "sub_agent", "message": "test message"},
+        raw_content="<sub_agent>test</sub_agent>",
+    )
+    return ParsedResponse(
+        original_response="test response",
+        tool_calls=[tool_call, sub_agent_call],
+        is_parallel_tools=True,
+    )
+
+
+class TestBeforeAgentHookInput:
+    """Tests for BeforeAgentHookInput dataclass."""
+
+    def test_initialization(self, agent_state, messages):
+        """Before-agent hook input captures agent state and messages."""
+        hook_input = BeforeAgentHookInput(agent_state=agent_state, messages=messages)
+
+        assert hook_input.agent_state == agent_state
+        assert hook_input.messages == messages
+
+
+class TestBeforeModelHookInput:
+    """Tests for BeforeModelHookInput dataclass."""
+
+    def test_initialization(self, agent_state, messages):
+        """Test initialization of BeforeModelHookInput."""
+        hook_input = BeforeModelHookInput(
+            agent_state=agent_state,
+            max_iterations=10,
+            current_iteration=3,
+            messages=messages,
+        )
+
+        assert hook_input.agent_state == agent_state
+        assert hook_input.max_iterations == 10
+        assert hook_input.current_iteration == 3
+        assert hook_input.messages == messages
+
+
+class TestAfterModelHookInput:
+    """Tests for AfterModelHookInput dataclass."""
+
+    def test_initialization(self, agent_state, messages, parsed_response):
+        """Test initialization of AfterModelHookInput."""
+        hook_input = AfterModelHookInput(
+            agent_state=agent_state,
+            max_iterations=10,
+            current_iteration=3,
+            messages=messages,
+            original_response="test response",
+            parsed_response=parsed_response,
+        )
+
+        assert hook_input.agent_state == agent_state
+        assert hook_input.max_iterations == 10
+        assert hook_input.current_iteration == 3
+        assert hook_input.messages == messages
+        assert hook_input.original_response == "test response"
+        assert hook_input.parsed_response == parsed_response
+
+    def test_initialization_with_none_parsed_response(self, agent_state, messages):
+        """Test initialization with None parsed_response."""
+        hook_input = AfterModelHookInput(
+            agent_state=agent_state,
+            max_iterations=10,
+            current_iteration=3,
+            messages=messages,
+            original_response="test response",
+            parsed_response=None,
+        )
+
+        assert hook_input.parsed_response is None
+
+
+class TestAfterAgentHookInput:
+    """Tests for AfterAgentHookInput dataclass."""
+
+    def test_initialization(self, agent_state, messages):
+        """After-agent hook input captures response metadata."""
+        hook_input = AfterAgentHookInput(
+            agent_state=agent_state,
+            messages=messages,
+            agent_response="done",
+            stop_reason=AgentStopReason.SUCCESS,
+        )
+
+        assert hook_input.agent_state == agent_state
+        assert hook_input.messages == messages
+        assert hook_input.agent_response == "done"
+        assert hook_input.stop_reason == AgentStopReason.SUCCESS
+
+    def test_stop_reason_optional(self, agent_state, messages):
+        """Stop reason defaults to None when omitted."""
+        hook_input = AfterAgentHookInput(
+            agent_state=agent_state,
+            messages=messages,
+            agent_response="done",
+        )
+
+        assert hook_input.stop_reason is None
+
+
+class TestBeforeModelHookResult:
+    """Tests for BeforeModelHookResult dataclass."""
+
+    def test_has_modifications_true(self):
+        """Test has_modifications returns True when messages are modified."""
+        result = BeforeModelHookResult(messages=[Message.user("test")])
+        assert result.has_modifications() is True
+
+    def test_has_modifications_false(self):
+        """Test has_modifications returns False when no modifications."""
+        result = BeforeModelHookResult(messages=None)
+        assert result.has_modifications() is False
+
+    def test_no_changes_classmethod(self):
+        """Test no_changes class method."""
+        result = BeforeModelHookResult.no_changes()
+        assert result.messages is None
+        assert result.has_modifications() is False
+
+    def test_with_modifications_messages(self):
+        """Test with_modifications with messages."""
+        messages = [Message.user("test")]
+        result = BeforeModelHookResult.with_modifications(messages=messages)
+        assert result.messages == messages
+        assert result.has_modifications() is True
+
+    def test_with_modifications_none(self):
+        """Test with_modifications with None."""
+        result = BeforeModelHookResult.with_modifications(messages=None)
+        assert result.messages is None
+        assert result.has_modifications() is False
+
+
+class TestAfterModelHookResult:
+    """Tests for AfterModelHookResult dataclass."""
+
+    def test_has_modifications_parsed_response(self, parsed_response):
+        """Test has_modifications with parsed_response."""
+        result = AfterModelHookResult(parsed_response=parsed_response)
+        assert result.has_modifications() is True
+
+    def test_has_modifications_messages(self):
+        """Test has_modifications with messages."""
+        result = AfterModelHookResult(messages=[Message.user("test")])
+        assert result.has_modifications() is True
+
+    def test_has_modifications_both(self, parsed_response):
+        """Test has_modifications with both modifications."""
+        result = AfterModelHookResult(
+            parsed_response=parsed_response,
+            messages=[Message.user("test")],
+        )
+        assert result.has_modifications() is True
+
+    def test_has_modifications_false(self):
+        """Test has_modifications returns False when no modifications."""
+        result = AfterModelHookResult()
+        assert result.has_modifications() is False
+
+    def test_no_changes_classmethod(self):
+        """Test no_changes class method."""
+        result = AfterModelHookResult.no_changes()
+        assert result.parsed_response is None
+        assert result.messages is None
+        assert result.has_modifications() is False
+
+    def test_with_modifications_parsed_response(self, parsed_response):
+        """Test with_modifications with parsed_response."""
+        result = AfterModelHookResult.with_modifications(parsed_response=parsed_response)
+        assert result.parsed_response == parsed_response
+        assert result.messages is None
+        assert result.has_modifications() is True
+
+    def test_with_modifications_messages(self):
+        """Test with_modifications with messages."""
+        messages = [Message.user("test")]
+        result = AfterModelHookResult.with_modifications(messages=messages)
+        assert result.parsed_response is None
+        assert result.messages == messages
+        assert result.has_modifications() is True
+
+    def test_with_modifications_both(self, parsed_response):
+        """Test with_modifications with both."""
+        messages = [Message.user("test")]
+        result = AfterModelHookResult.with_modifications(
+            parsed_response=parsed_response,
+            messages=messages,
+        )
+        assert result.parsed_response == parsed_response
+        assert result.messages == messages
+        assert result.has_modifications() is True
+
+    def test_force_continue_default_false(self):
+        """Test force_continue defaults to False."""
+        result = AfterModelHookResult()
+        assert result.force_continue is False
+        assert result.has_modifications() is False
+
+    def test_force_continue_set_true(self):
+        """Test force_continue can be set to True."""
+        result = AfterModelHookResult(force_continue=True)
+        assert result.force_continue is True
+        assert result.has_modifications() is True
+
+    def test_no_changes_force_continue_false(self):
+        """Test no_changes returns force_continue=False."""
+        result = AfterModelHookResult.no_changes()
+        assert result.force_continue is False
+        assert result.has_modifications() is False
+
+    def test_with_modifications_force_continue_true(self):
+        """Test with_modifications with force_continue=True."""
+        messages = [Message.user("feedback")]
+        result = AfterModelHookResult.with_modifications(
+            messages=messages,
+            force_continue=True,
+        )
+        assert result.messages == messages
+        assert result.force_continue is True
+        assert result.has_modifications() is True
+
+    def test_with_modifications_force_continue_default(self):
+        """Test with_modifications force_continue defaults to False."""
+        messages = [Message.user("test")]
+        result = AfterModelHookResult.with_modifications(messages=messages)
+        assert result.force_continue is False
+
+    def test_has_modifications_with_force_continue_only(self):
+        """Test has_modifications returns True when only force_continue is set."""
+        result = AfterModelHookResult(force_continue=True)
+        assert result.parsed_response is None
+        assert result.messages is None
+        assert result.force_continue is True
+        assert result.has_modifications() is True
+
+
+class TestAfterToolHookInput:
+    """Tests for AfterToolHookInput dataclass."""
+
+    def test_initialization(self, agent_state):
+        """Test initialization of AfterToolHookInput."""
+        hook_input = AfterToolHookInput(
+            agent_state=agent_state,
+            tool_name="test_tool",
+            tool_call_id="call_123",
+            tool_input={"param": "value"},
+            tool_output="result",
+            sandbox=LocalSandbox(),
+        )
+
+        assert hook_input.agent_state == agent_state
+        assert hook_input.tool_name == "test_tool"
+        assert hook_input.tool_call_id == "call_123"
+        assert hook_input.tool_input == {"param": "value"}
+        assert hook_input.tool_output == "result"
+        assert hook_input.llm_tool_output is None
+
+    def test_initialization_with_parallel_execution_id(self, agent_state):
+        """Test initialization of AfterToolHookInput with parallel_execution_id."""
+        hook_input = AfterToolHookInput(
+            agent_state=agent_state,
+            tool_name="test_tool",
+            tool_call_id="call_123",
+            tool_input={"param": "value"},
+            tool_output="result",
+            sandbox=LocalSandbox(),
+            parallel_execution_id="uuid-xxx-123",
+        )
+
+        assert hook_input.parallel_execution_id == "uuid-xxx-123"
+
+    def test_parallel_execution_id_optional(self, agent_state):
+        """Test parallel_execution_id is optional and defaults to None."""
+        hook_input = AfterToolHookInput(
+            agent_state=agent_state,
+            tool_name="test_tool",
+            tool_call_id="call_123",
+            tool_input={"param": "value"},
+            tool_output="result",
+            sandbox=LocalSandbox(),
+        )
+
+        assert hook_input.parallel_execution_id is None
+
+
+class TestBeforeToolHookInput:
+    """Tests for BeforeToolHookInput dataclass with parallel_execution_id."""
+
+    def test_initialization_with_parallel_execution_id(self, agent_state):
+        """Test initialization of BeforeToolHookInput with parallel_execution_id."""
+        hook_input = BeforeToolHookInput(
+            agent_state=agent_state,
+            tool_name="test_tool",
+            tool_call_id="call_123",
+            tool_input={"param": "value"},
+            sandbox=LocalSandbox(),
+            parallel_execution_id="uuid-xxx-456",
+        )
+
+        assert hook_input.parallel_execution_id == "uuid-xxx-456"
+
+    def test_parallel_execution_id_defaults_to_none(self, agent_state):
+        """Test parallel_execution_id defaults to None when not provided."""
+        hook_input = BeforeToolHookInput(
+            agent_state=agent_state,
+            tool_name="test_tool",
+            tool_call_id="call_123",
+            tool_input={"param": "value"},
+            sandbox=LocalSandbox(),
+        )
+
+        assert hook_input.parallel_execution_id is None
+
+
+class TestAfterToolHookResult:
+    """Tests for AfterToolHookResult dataclass."""
+
+    def test_has_modifications_true(self):
+        """Test has_modifications returns True when tool_output is set."""
+        result = AfterToolHookResult(tool_output="modified")
+        assert result.has_modifications() is True
+
+    def test_has_modifications_true_with_llm_output(self):
+        """LLM tool output alone also counts as a modification."""
+        result = AfterToolHookResult(llm_tool_output="formatted")
+        assert result.has_modifications() is True
+
+    def test_has_modifications_false(self):
+        """Test has_modifications returns False when no modifications."""
+        result = AfterToolHookResult()
+        assert result.has_modifications() is False
+
+    def test_no_changes_classmethod(self):
+        """Test no_changes class method."""
+        result = AfterToolHookResult.no_changes()
+        assert result.tool_output is None
+        assert result.has_modifications() is False
+
+    def test_with_modifications(self):
+        """Test with_modifications class method."""
+        result = AfterToolHookResult.with_modifications(tool_output="modified", llm_tool_output="formatted")
+        assert result.tool_output == "modified"
+        assert result.llm_tool_output == "formatted"
+        assert result.has_modifications() is True
+
+
+class TestHookResult:
+    """Generic HookResult behaviors."""
+
+    def test_agent_response_counts_as_modification(self):
+        """Setting agent_response toggles has_modifications."""
+        result = HookResult(agent_response="done")
+        assert result.has_agent_response() is True
+        assert result.has_modifications() is True
+
+    def test_with_modifications_agent_response(self):
+        """with_modifications can update the agent response."""
+        result = HookResult.with_modifications(agent_response="final")
+        assert result.agent_response == "final"
+        assert result.has_modifications() is True
+
+
+class TestMiddlewareManager:
+    """Tests for the unified middleware manager."""
+
+    def test_run_before_model_in_order(self, agent_state, messages):
+        """Before-model hooks execute from first to last."""
+        order: list[str] = []
+
+        def make_hook(name: str):
+            def hook(hook_input: BeforeModelHookInput) -> HookResult:
+                order.append(name)
+                new_messages = hook_input.messages + [Message(role=Role.SYSTEM, content=[TextBlock(text=name)])]
+                return HookResult.with_modifications(messages=new_messages)
+
+            return hook
+
+        manager = MiddlewareManager(
+            [
+                FunctionMiddleware(before_model_hook=make_hook("first")),
+                FunctionMiddleware(before_model_hook=make_hook("second")),
+            ],
+        )
+
+        hook_input = BeforeModelHookInput(
+            agent_state=agent_state,
+            max_iterations=5,
+            current_iteration=1,
+            messages=messages.copy(),
+        )
+
+        updated_messages = manager.run_before_model(hook_input)
+        assert order == ["first", "second"]
+        assert [msg.get_text_content() for msg in updated_messages[-2:]] == ["first", "second"]
+
+    def test_run_after_model_reverse_order_with_force_continue(self, agent_state, messages, parsed_response):
+        """After-model hooks execute in reverse order and can set force_continue."""
+        order: list[str] = []
+
+        def feedback_hook(hook_input: AfterModelHookInput) -> HookResult:
+            order.append("feedback")
+            new_messages = hook_input.messages + [Message(role=Role.USER, content=[TextBlock(text="feedback")])]
+            return HookResult.with_modifications(messages=new_messages)
+
+        def cleanup_hook(hook_input: AfterModelHookInput) -> HookResult:
+            order.append("cleanup")
+            parsed_response = hook_input.parsed_response
+            if parsed_response is None:
+                return HookResult.no_changes()
+            parsed_response.tool_calls = []
+            return HookResult.with_modifications(parsed_response=parsed_response, force_continue=True)
+
+        manager = MiddlewareManager(
+            [
+                FunctionMiddleware(after_model_hook=feedback_hook),
+                FunctionMiddleware(after_model_hook=cleanup_hook),
+            ],
+        )
+
+        hook_input = AfterModelHookInput(
+            agent_state=agent_state,
+            max_iterations=5,
+            current_iteration=1,
+            messages=messages.copy(),
+            original_response="resp",
+            parsed_response=parsed_response,
+        )
+
+        parsed, updated_messages, force_continue = manager.run_after_model(hook_input)
+        assert order == ["cleanup", "feedback"]
+        assert parsed is parsed_response
+        assert not parsed.tool_calls
+        assert updated_messages[-1].get_text_content() == "feedback"
+        assert force_continue is True
+
+    def test_run_before_model_surfaces_force_stop_reason(self, agent_state, messages):
+        """RFC-0027: before_model HookResult.force_stop_reason is surfaced onto the outparam."""
+
+        def stop_hook(hook_input: BeforeModelHookInput) -> HookResult:
+            return HookResult(force_stop_reason=AgentStopReason.ERROR_OCCURRED)
+
+        manager = MiddlewareManager([FunctionMiddleware(before_model_hook=stop_hook)])
+        hook_input = BeforeModelHookInput(
+            agent_state=agent_state,
+            max_iterations=5,
+            current_iteration=1,
+            messages=messages.copy(),
+        )
+
+        manager.run_before_model(hook_input)
+        assert hook_input.force_stop_reason is AgentStopReason.ERROR_OCCURRED
+
+    def test_run_before_model_clears_stale_force_stop_reason(self, agent_state, messages):
+        """RFC-0027: stale force_stop_reason from a prior iter is cleared when no middleware sets it."""
+        manager = MiddlewareManager([FunctionMiddleware(before_model_hook=lambda hi: HookResult.no_changes())])
+        hook_input = BeforeModelHookInput(
+            agent_state=agent_state,
+            max_iterations=5,
+            current_iteration=1,
+            messages=messages.copy(),
+            force_stop_reason=AgentStopReason.ERROR_OCCURRED,  # stale
+        )
+
+        manager.run_before_model(hook_input)
+        assert hook_input.force_stop_reason is None
+
+    def test_run_after_model_surfaces_force_stop_reason(self, agent_state, messages, parsed_response):
+        """RFC-0027: after_model HookResult.force_stop_reason is surfaced onto the outparam."""
+
+        def stop_hook(hook_input: AfterModelHookInput) -> HookResult:
+            return HookResult(force_stop_reason=AgentStopReason.ERROR_OCCURRED)
+
+        manager = MiddlewareManager([FunctionMiddleware(after_model_hook=stop_hook)])
+        hook_input = AfterModelHookInput(
+            agent_state=agent_state,
+            max_iterations=5,
+            current_iteration=1,
+            messages=messages.copy(),
+            original_response="resp",
+            parsed_response=parsed_response,
+        )
+
+        manager.run_after_model(hook_input)
+        assert hook_input.force_stop_reason is AgentStopReason.ERROR_OCCURRED
+
+    def test_run_after_tool_reverse_order(self, agent_state):
+        """After-tool hooks execute from last to first."""
+        order: list[str] = []
+
+        def make_tool_hook(name: str):
+            def hook(hook_input: AfterToolHookInput) -> HookResult:
+                order.append(name)
+                return HookResult.with_modifications(tool_output=f"{hook_input.tool_output}-{name}")
+
+            return hook
+
+        manager = MiddlewareManager(
+            [
+                FunctionMiddleware(after_tool_hook=make_tool_hook("first")),
+                FunctionMiddleware(after_tool_hook=make_tool_hook("second")),
+            ],
+        )
+
+        hook_input = AfterToolHookInput(
+            agent_state=agent_state,
+            tool_name="demo",
+            tool_call_id="call_1",
+            tool_input={},
+            tool_output="base",
+            sandbox=LocalSandbox(),
+        )
+
+        result, llm_result = manager.run_after_tool(hook_input, "base")
+        assert order == ["second", "first"]
+        assert result == "base-second-first"
+        assert llm_result is None
+
+    def test_run_after_tool_tracks_llm_output_separately(self, agent_state):
+        """LLM-facing output should flow through after_tool middleware independently."""
+
+        def llm_hook(hook_input: AfterToolHookInput) -> HookResult:
+            assert hook_input.tool_output == {"result": "raw"}
+            assert hook_input.llm_tool_output == "formatted"
+            return HookResult.with_modifications(llm_tool_output="formatted-2")
+
+        manager = MiddlewareManager([FunctionMiddleware(after_tool_hook=llm_hook)])
+        hook_input = AfterToolHookInput(
+            agent_state=agent_state,
+            tool_name="demo",
+            tool_call_id="call_1",
+            tool_input={},
+            tool_output={"result": "raw"},
+            llm_tool_output="formatted",
+            sandbox=LocalSandbox(),
+        )
+
+        raw_result, llm_result = manager.run_after_tool(hook_input, {"result": "raw"}, "formatted")
+        assert raw_result == {"result": "raw"}
+        assert llm_result == "formatted-2"
+
+    def test_wrap_model_call_nested(self):
+        """wrap_model_call applies middleware in a nested fashion."""
+        call_log: list[str] = []
+
+        class RecordingMiddleware(Middleware):
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def wrap_model_call(self, params: ModelCallParams, call_next):  # type: ignore[override]
+                call_log.append(f"before_{self.name}")
+                result = call_next(params)
+                call_log.append(f"after_{self.name}")
+                return result
+
+        manager = MiddlewareManager(
+            [RecordingMiddleware("outer"), RecordingMiddleware("inner")],
+        )
+
+        params = ModelCallParams(
+            messages=[Message.user("hi")],
+            max_tokens=10,
+            force_stop_reason=None,
+            agent_state=None,
+            tool_call_mode="xml",
+            tools=None,
+            api_params={},
+            openai_client=None,
+            llm_config=None,
+        )
+
+        def base_call(_: ModelCallParams) -> ModelResponse:
+            call_log.append("base")
+            return ModelResponse(content="ok")
+
+        response = manager.wrap_model_call(params, base_call)
+        assert response.content == "ok"
+        assert call_log == ["before_outer", "before_inner", "base", "after_inner", "after_outer"]
+
+    def test_wrap_tool_call_nested(self, agent_state):
+        """wrap_tool_call applies middleware in a nested fashion for tools."""
+        call_log: list[str] = []
+
+        class RecordingMiddleware(Middleware):
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def wrap_tool_call(self, params: ToolCallParams, call_next):  # type: ignore[override]
+                call_log.append(f"before_{self.name}")
+                result = call_next(params)
+                call_log.append(f"after_{self.name}")
+                return result
+
+        manager = MiddlewareManager(
+            [RecordingMiddleware("outer"), RecordingMiddleware("inner")],
+        )
+
+        params = ToolCallParams(
+            agent_state=agent_state,
+            tool_name="demo",
+            parameters={},
+            tool_call_id="call_1",
+            execution_params={},
+            sandbox=LocalSandbox(),
+        )
+
+        def base_call(_: ToolCallParams) -> dict[str, str]:
+            call_log.append("base")
+            return {"result": "ok"}
+
+        result = manager.wrap_tool_call(params, base_call)
+        assert result == {"result": "ok"}
+        assert call_log == ["before_outer", "before_inner", "base", "after_inner", "after_outer"]
+
+    def test_run_before_tool(self, agent_state):
+        """before_tool hooks run first-to-last and can modify input."""
+        order: list[str] = []
+
+        def make_hook(name: str):
+            def hook(hook_input: BeforeToolHookInput) -> HookResult:
+                order.append(name)
+                updated = dict(hook_input.tool_input)
+                updated[name] = True
+                return HookResult.with_modifications(tool_input=updated)
+
+            return hook
+
+        manager = MiddlewareManager(
+            [
+                FunctionMiddleware(before_tool_hook=make_hook("first")),
+                FunctionMiddleware(before_tool_hook=make_hook("second")),
+            ],
+        )
+
+        hook_input = BeforeToolHookInput(
+            agent_state=agent_state,
+            tool_name="demo",
+            tool_call_id="call_1",
+            tool_input={"initial": True},
+            sandbox=LocalSandbox(),
+        )
+
+        updated = manager.run_before_tool(hook_input)
+        assert order == ["first", "second"]
+        assert updated == {"initial": True, "first": True, "second": True}
+
+    def test_logging_middleware_wrap_model_call(self, agent_state, capsys):
+        """LoggingMiddleware can wrap model calls and emit console output."""
+        middleware = LoggingMiddleware(log_model_calls=True)
+
+        params = ModelCallParams(
+            messages=[Message.user("hello")],
+            max_tokens=10,
+            force_stop_reason=None,
+            agent_state=agent_state,
+            tool_call_mode="xml",
+            tools=None,
+            api_params={},
+            openai_client=None,
+            llm_config=None,
+            retry_attempts=1,
+        )
+
+        def base_call(_: ModelCallParams) -> ModelResponse:
+            return ModelResponse(content="hi")
+
+        result = middleware.wrap_model_call(params, base_call)
+        assert isinstance(result, ModelResponse)
+        captured = capsys.readouterr().out
+        assert "LLM call invoked with 1 messages" in captured
+
+    def test_logging_middleware_after_model_with_parsed_response(self, agent_state, messages, parsed_response, caplog):
+        """after_model logs parsed-response details when a logger is configured."""
+
+        logger_name = "tests.logging.middleware.parsed"
+        middleware = LoggingMiddleware(model_logger=logger_name, message_preview_chars=20)
+        caplog.set_level(logging.INFO, logger=logger_name)
+
+        hook_input = AfterModelHookInput(
+            agent_state=agent_state,
+            max_iterations=5,
+            current_iteration=1,
+            messages=messages,
+            original_response="response body",
+            parsed_response=parsed_response,
+        )
+
+        middleware.after_model(hook_input)
+
+        joined = "\n".join(record.getMessage() for record in caplog.records if record.name == logger_name)
+        assert "AFTER MODEL HOOK TRIGGERED" in joined
+        assert "Tool calls:" in joined
+        assert "Recent message" in joined
+
+    def test_logging_middleware_after_model_without_parsed_response(self, agent_state, messages, caplog):
+        """after_model handles None parsed_response gracefully."""
+
+        logger_name = "tests.logging.middleware.empty"
+        middleware = LoggingMiddleware(model_logger=logger_name)
+        caplog.set_level(logging.INFO, logger=logger_name)
+
+        hook_input = AfterModelHookInput(
+            agent_state=agent_state,
+            max_iterations=3,
+            current_iteration=0,
+            messages=messages,
+            original_response="text",
+            parsed_response=None,
+        )
+
+        middleware.after_model(hook_input)
+
+        joined = "\n".join(record.getMessage() for record in caplog.records if record.name == logger_name)
+        assert "No parsed response available" in joined
+
+    def test_logging_middleware_after_tool_logs_full_output(self, agent_state, caplog):
+        """after_tool logs details when a logger is configured."""
+
+        logger_name = "tests.logging.middleware.tool"
+        middleware = LoggingMiddleware(tool_logger=logger_name)
+        caplog.set_level(logging.INFO, logger=logger_name)
+
+        hook_input = AfterToolHookInput(
+            agent_state=agent_state,
+            tool_name="calc",
+            tool_call_id="call_1",
+            tool_input={"a": 1},
+            tool_output="result text",
+            sandbox=LocalSandbox(),
+        )
+
+        middleware.after_tool(hook_input)
+
+        joined = "\n".join(record.getMessage() for record in caplog.records if record.name == logger_name)
+        assert "AFTER TOOL HOOK TRIGGERED" in joined
+        assert "Tool: calc" in joined
+        assert "Tool output: result text" in joined
+
+    def test_logging_middleware_after_tool_logs_llm_output(self, agent_state, caplog):
+        """after_tool logs llm-facing output when present."""
+
+        logger_name = "tests.logging.middleware.tool.llm"
+        middleware = LoggingMiddleware(tool_logger=logger_name)
+        caplog.set_level(logging.INFO, logger=logger_name)
+
+        hook_input = AfterToolHookInput(
+            agent_state=agent_state,
+            tool_name="calc",
+            tool_call_id="call_1",
+            tool_input={"a": 1},
+            tool_output={"result": "raw"},
+            llm_tool_output="formatted output",
+            sandbox=LocalSandbox(),
+        )
+
+        middleware.after_tool(hook_input)
+
+        joined = "\n".join(record.getMessage() for record in caplog.records if record.name == logger_name)
+        assert "LLM tool output: formatted output" in joined
+
+    def test_logging_middleware_after_tool_truncates_output(self, agent_state, caplog):
+        """after_tool truncates long outputs when preview limit is exceeded."""
+
+        logger_name = "tests.logging.middleware.tool.truncate"
+        middleware = LoggingMiddleware(tool_logger=logger_name, tool_preview_chars=5)
+        caplog.set_level(logging.INFO, logger=logger_name)
+
+        hook_input = AfterToolHookInput(
+            agent_state=agent_state,
+            tool_name="calc",
+            tool_call_id="call_1",
+            tool_input={},
+            tool_output="123456789",
+            sandbox=LocalSandbox(),
+        )
+
+        middleware.after_tool(hook_input)
+
+        joined = "\n".join(record.getMessage() for record in caplog.records if record.name == logger_name)
+        assert "truncated" in joined
+
+
+class TestHookProtocols:
+    """Tests for hook protocol compliance."""
+
+    def test_before_model_hook_protocol(self, agent_state, messages):
+        """Test that a function conforms to BeforeModelHook protocol."""
+
+        def my_hook(hook_input: BeforeModelHookInput) -> BeforeModelHookResult:
+            return BeforeModelHookResult.no_changes()
+
+        # This should type-check and work
+        hook_input = BeforeModelHookInput(
+            agent_state=agent_state,
+            max_iterations=10,
+            current_iteration=5,
+            messages=messages,
+        )
+        result = my_hook(hook_input)
+        assert isinstance(result, BeforeModelHookResult)
+
+    def test_after_model_hook_protocol(self, agent_state, messages, parsed_response):
+        """Test that a function conforms to AfterModelHook protocol."""
+
+        def my_hook(hook_input: AfterModelHookInput) -> AfterModelHookResult:
+            return AfterModelHookResult.no_changes()
+
+        hook_input = AfterModelHookInput(
+            agent_state=agent_state,
+            max_iterations=10,
+            current_iteration=5,
+            messages=messages,
+            original_response="test",
+            parsed_response=parsed_response,
+        )
+        result = my_hook(hook_input)
+        assert isinstance(result, AfterModelHookResult)
+
+    def test_after_tool_hook_protocol(self, agent_state):
+        """Test that a function conforms to AfterToolHook protocol."""
+
+        def my_hook(hook_input: AfterToolHookInput) -> AfterToolHookResult:
+            return AfterToolHookResult.no_changes()
+
+        hook_input = AfterToolHookInput(
+            agent_state=agent_state,
+            tool_name="test_tool",
+            tool_call_id="call_123",
+            tool_input={"param": "value"},
+            tool_output="result",
+            sandbox=LocalSandbox(),
+        )
+        result = my_hook(hook_input)
+        assert isinstance(result, AfterToolHookResult)
+
+
+class TestToolCallParallelExecutionId:
+    """Tests for ToolCall parallel_execution_id field."""
+
+    def test_tool_call_with_parallel_execution_id(self):
+        """Test ToolCall initialization with parallel_execution_id."""
+        tool_call = ToolCall(
+            tool_name="search",
+            parameters={"query": "test"},
+            raw_content="<tool>search</tool>",
+            parallel_execution_id="uuid-parallel-123",
+        )
+
+        assert tool_call.parallel_execution_id == "uuid-parallel-123"
+
+    def test_tool_call_parallel_execution_id_optional(self):
+        """Test ToolCall parallel_execution_id is optional."""
+        tool_call = ToolCall(
+            tool_name="search",
+            parameters={"query": "test"},
+            raw_content="<tool>search</tool>",
+        )
+
+        assert tool_call.parallel_execution_id is None
+
+
+class TestSubAgentToolCallParallelExecutionId:
+    """Tests for Agent ToolCall parallel_execution_id field."""
+
+    def test_sub_agent_call_with_parallel_execution_id(self):
+        """Test Agent ToolCall initialization with parallel_execution_id."""
+        sub_agent_call = ToolCall(
+            tool_name="Agent",
+            parameters={"sub_agent_name": "research_agent", "message": "Find information"},
+            raw_content="<sub_agent>research</sub_agent>",
+            parallel_execution_id="uuid-parallel-456",
+        )
+
+        assert sub_agent_call.parallel_execution_id == "uuid-parallel-456"
+
+    def test_sub_agent_call_parallel_execution_id_optional(self):
+        """Test Agent ToolCall parallel_execution_id is optional."""
+        sub_agent_call = ToolCall(
+            tool_name="Agent",
+            parameters={"sub_agent_name": "research_agent", "message": "Find information"},
+            raw_content="<sub_agent>research</sub_agent>",
+        )
+
+        assert sub_agent_call.parallel_execution_id is None

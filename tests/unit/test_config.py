@@ -1,0 +1,1203 @@
+# Copyright (c) Nex-AGI. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for configuration loading and normalization."""
+
+from __future__ import annotations
+
+import textwrap
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from nexau.archs.main_sub.config import ConfigError as ConfigConfigError
+from nexau.archs.main_sub.config.base import AgentConfigLoadOptions
+from nexau.archs.main_sub.config.config import AgentConfig, AgentConfigBuilder, ExecutionConfig
+from nexau.archs.main_sub.config.schema import (
+    AgentConfigSchema,
+    normalize_agent_config_dict,
+)
+from nexau.archs.main_sub.config.schema import (
+    ConfigError as SchemaConfigError,
+)
+from nexau.archs.main_sub.utils.common import ConfigError as UtilsConfigError
+from nexau.archs.main_sub.utils.common import load_yaml_with_vars
+from nexau.archs.tool.tool import Tool
+from nexau.archs.tracer.core import BaseTracer, Span, SpanType
+
+MODULE_PATH = __name__
+
+
+def sample_hook_fn(value: int = 0) -> int:
+    """Simple hook used for import tests."""
+
+    return value
+
+
+class SampleHookClass:
+    """Callable hook class to verify parameter instantiation."""
+
+    def __init__(self, value: int):
+        self.value = value
+
+    def __call__(self, *args: Any, **kwargs: Any) -> int:  # pragma: no cover - trivial passthrough
+        return self.value
+
+
+class ConfigDummyTracer(BaseTracer):
+    """Concrete tracer for testing."""
+
+    def __init__(self, name: str = "dummy") -> None:
+        self.name = name
+        self.started: list[Span] = []
+
+    def start_span(
+        self,
+        name: str,
+        span_type: SpanType,
+        inputs: dict[str, Any] | None = None,
+        parent_span: Span | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> Span:
+        span = Span(
+            id=name,
+            name=name,
+            type=span_type,
+            parent_id=parent_span.id if parent_span else None,
+            inputs=inputs or {},
+            attributes=attributes or {},
+        )
+        self.started.append(span)
+        return span
+
+    def end_span(
+        self,
+        span: Span,
+        outputs: Any = None,
+        error: Exception | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        span.outputs = outputs or {}
+        span.error = str(error) if error else None
+        span.attributes.update(attributes or {})
+
+
+def sample_token_counter(messages: list[dict[str, Any]], offset: int = 0) -> int:
+    """Token counter used to validate token_counter wiring."""
+
+    return len(messages) + offset
+
+
+class ImportableTracer(ConfigDummyTracer):
+    """Tracer referenced via import string."""
+
+    def __init__(self, label: str | None = None) -> None:
+        super().__init__(label or "importable")
+
+
+class StubTemplate:
+    def __init__(self, template: str):
+        self.template = template
+
+    def render(self, context: dict[str, Any]) -> str:
+        tool = context.get("tool")
+        return f"{self.template}-{getattr(tool, 'name', 'unknown')}"
+
+
+class StubPromptBuilder:
+    """Lightweight PromptBuilder stand-in to avoid reading templates from disk."""
+
+    def load_prompt_template(self, _: str) -> str:
+        return "skill-detail"
+
+    @property
+    def jinja_env(self):
+        class _Env:
+            @staticmethod
+            def from_string(template: str) -> StubTemplate:
+                return StubTemplate(template)
+
+        return _Env()
+
+
+class TestLoadYamlWithVars:
+    """Tests for YAML loading helpers."""
+
+    def test_replaces_env_and_this_file_dir(self, temp_dir, monkeypatch):
+        monkeypatch.setenv("TEST_ENV_VAR", "hello")
+        content = textwrap.dedent(
+            """
+            system_prompt: "Here ${this_file_dir}"
+            value: ${env.TEST_ENV_VAR}
+            """,
+        )
+        path = Path(temp_dir) / "config.yaml"
+        path.write_text(content)
+
+        result = load_yaml_with_vars(path)
+
+        assert "Here" in result["system_prompt"]
+        assert Path(temp_dir).as_posix() in result["system_prompt"]
+        assert result["value"] == "hello"
+
+    def test_yaml_variables_block_resolved_and_removed(self, temp_dir):
+        content = textwrap.dedent(
+            """
+            variables:
+              model_name: gpt-4o
+            name: test_agent
+            prompt: ${variables.model_name}
+            llm_config:
+              model: ${variables.model_name}
+            """,
+        )
+        config_file = Path(temp_dir) / "config.yaml"
+        config_file.write_text(content)
+
+        result = load_yaml_with_vars(config_file)
+
+        assert result["prompt"] == "gpt-4o"
+        assert result["llm_config"]["model"] == "gpt-4o"
+        assert "variables" not in result
+
+    def test_missing_variable_raises(self, temp_dir):
+        content = textwrap.dedent(
+            """
+            variables:
+              foo: bar
+            value: ${variables.unknown}
+            """,
+        )
+        path = Path(temp_dir) / "missing.yaml"
+        path.write_text(content)
+
+        with pytest.raises(UtilsConfigError, match="unknown"):
+            load_yaml_with_vars(path)
+
+    def test_non_scalar_embedding_raises(self, temp_dir):
+        content = textwrap.dedent(
+            """
+            variables:
+              mapping:
+                key: value
+            value: "prefix-${variables.mapping}"
+            """,
+        )
+        path = Path(temp_dir) / "non_scalar.yaml"
+        path.write_text(content)
+
+        with pytest.raises(UtilsConfigError, match="non-scalar value"):
+            load_yaml_with_vars(path)
+
+    def test_invalid_variables_block_raises(self, temp_dir):
+        path = Path(temp_dir) / "bad.yaml"
+        path.write_text("variables: true\nname: tester\n")
+
+        with pytest.raises(UtilsConfigError, match="must be a mapping"):
+            load_yaml_with_vars(path)
+
+
+class TestSchemaNormalization:
+    """Tests around AgentConfigSchema normalization."""
+
+    def test_normalize_agent_config_dict_round_trips(self):
+        config = {
+            "name": "demo",
+            "llm_config": {"model": "gpt-4o-mini"},
+            "tools": [],
+            "sub_agents": [],
+            "max_iterations": 5,
+        }
+
+        normalized = normalize_agent_config_dict(config)
+
+        assert normalized["name"] == "demo"
+        assert normalized["llm_config"]["model"] == "gpt-4o-mini"
+        assert normalized["max_iterations"] == 5
+        assert "type" not in normalized or normalized.get("type") == "agent"
+
+    def test_normalize_agent_config_dict_reports_invalid_tools(self):
+        config = {"name": "demo", "llm_config": {"model": "gpt-4o-mini"}, "tools": "not-a-list"}
+
+        with pytest.raises(SchemaConfigError, match="tools"):
+            normalize_agent_config_dict(config)
+
+    def test_normalize_agent_config_dict_reports_unknown_fields(self):
+        config = {
+            "name": "demo",
+            "llm_config": {"model": "gpt-4o-mini"},
+            "tools": [],
+            "unexpected": True,
+        }
+
+        with pytest.raises(SchemaConfigError, match="unexpected"):
+            normalize_agent_config_dict(config)
+
+    def test_agent_config_schema_from_yaml_errors_on_missing_or_empty(self, temp_dir):
+        missing_path = Path(temp_dir) / "missing.yaml"
+        with pytest.raises(SchemaConfigError, match="not found"):
+            AgentConfigSchema.from_yaml(str(missing_path))
+
+        empty_path = Path(temp_dir) / "empty.yaml"
+        empty_path.write_text("")
+        with pytest.raises(SchemaConfigError, match="Empty or invalid"):
+            AgentConfigSchema.from_yaml(str(empty_path))
+
+    def test_agent_config_schema_from_yaml_invalid_yaml(self, temp_dir):
+        bad_path = Path(temp_dir) / "bad.yaml"
+        bad_path.write_text("name: test\nllm_config: [unterminated")
+
+        with pytest.raises(SchemaConfigError, match="YAML parsing error"):
+            AgentConfigSchema.from_yaml(str(bad_path))
+
+
+class TestConditionalBuiltinToolInjection:
+    """Tests for conditional runtime built-in tool injection."""
+
+    def test_websearch_not_injected_without_api_key(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """RFC-0028: 没配搜索密钥时不注入 web_search。"""
+        monkeypatch.delenv("SEARCH_API_KEY", raising=False)
+        monkeypatch.delenv("SERPER_API_KEY", raising=False)
+
+        config = AgentConfig.from_dict(
+            {
+                "type": "agent",
+                "name": "minimal",
+                "llm_config": {"model": "gpt-4o-mini"},
+                "plugins": [],
+                "tools": [],
+            },
+            base_path=tmp_path,
+        )
+
+        assert "web_search" not in {tool.name for tool in config.tools}
+
+    @pytest.mark.parametrize("env_key", ["SEARCH_API_KEY", "SERPER_API_KEY"])
+    def test_websearch_injected_when_api_key_present(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        env_key: str,
+    ) -> None:
+        """RFC-0028: 配了搜索密钥就自动获得 web_search。"""
+        monkeypatch.delenv("SEARCH_API_KEY", raising=False)
+        monkeypatch.delenv("SERPER_API_KEY", raising=False)
+        monkeypatch.setenv(env_key, "dummy-key")
+
+        config = AgentConfig.from_dict(
+            {
+                "type": "agent",
+                "name": "minimal",
+                "llm_config": {"model": "gpt-4o-mini"},
+                "plugins": [],
+                "tools": [],
+            },
+            base_path=tmp_path,
+        )
+
+        tools_by_name = {tool.name: tool for tool in config.tools}
+        assert "web_search" in tools_by_name
+        assert tools_by_name["web_search"].implementation_import_path == "nexau.archs.tool.builtin.web_tools:web_search"
+
+
+def test_minimal_agent_does_not_receive_runtime_builtin_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A minimal agent must not receive undeclared runtime built-in tools."""
+    monkeypatch.delenv("SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+
+    config_path = tmp_path / "agent.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            type: agent
+            name: minimal
+            llm_config:
+              model: gpt-4o-mini
+            """,
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    config = AgentConfig.from_yaml(config_path)
+
+    forbidden_tool_names = {
+        "run_shell_command",
+        "read_file",
+        "write_file",
+        "write_todos",
+        "complete_task",
+        "ask_user",
+    }
+    assert forbidden_tool_names.isdisjoint({tool.name for tool in config.tools})
+
+
+class TestAgentConfigBuilderCore:
+    """Tests for core builder behaviors."""
+
+    def test_build_core_properties_sets_defaults(self, temp_dir):
+        builder = AgentConfigBuilder({"name": "builder"}, Path(temp_dir))
+        builder.build_core_properties()
+
+        assert builder.agent_params["name"] == "builder"
+        assert builder.agent_params["max_context_tokens"] == 128000
+        assert builder.agent_params["max_running_subagents"] == 5
+        assert builder.agent_params["stop_tools"] == set()
+
+    def test_build_mcp_servers_validates_entries(self, temp_dir):
+        config = {
+            "mcp_servers": [
+                {"name": "stdio", "type": "stdio", "command": "python"},
+                {"name": "http", "type": "http", "url": "http://localhost"},
+            ]
+        }
+        builder = AgentConfigBuilder(config, Path(temp_dir))
+        builder.build_mcp_servers()
+
+        assert len(builder.agent_params["mcp_servers"]) == 2
+        assert builder.agent_params["mcp_servers"][0]["name"] == "stdio"
+        assert builder.agent_params["mcp_servers"][0]["source_id"] == "local:mcp_server:stdio"
+        assert builder.agent_params["mcp_servers"][1]["type"] == "http"
+
+    def test_build_mcp_servers_rejects_non_list(self, temp_dir):
+        builder = AgentConfigBuilder({"mcp_servers": "invalid"}, Path(temp_dir))
+
+        with pytest.raises(ConfigConfigError, match="must be a list"):
+            builder.build_mcp_servers()
+
+    def test_build_mcp_servers_http_requires_url(self, temp_dir):
+        builder = AgentConfigBuilder({"mcp_servers": [{"name": "http_svr", "type": "http"}]}, Path(temp_dir))
+
+        with pytest.raises(ConfigConfigError, match="missing 'url'"):
+            builder.build_mcp_servers()
+
+    def test_build_hooks_supports_strings_dicts_and_callables(self, temp_dir):
+        hook_import = f"{MODULE_PATH}:sample_hook_fn"
+        hook_dict = {"import": f"{MODULE_PATH}:SampleHookClass", "params": {"value": 5}}
+
+        builder = AgentConfigBuilder(
+            {
+                "after_model_hooks": [hook_import, hook_dict, sample_hook_fn],
+                "middlewares": [hook_import],
+            },
+            Path(temp_dir),
+        )
+
+        builder.build_hooks()
+
+        assert len(builder.agent_params["after_model_hooks"]) == 3
+        assert builder.agent_params["after_model_hooks"][0](value=2) == 2
+        assert builder.agent_params["after_model_hooks"][1]() == 5
+        assert builder.agent_params["middlewares"][0](value=1) == 1
+
+    def test_build_hooks_bad_types(self, temp_dir):
+        builder = AgentConfigBuilder({"after_model_hooks": "oops"}, Path(temp_dir))
+
+        with pytest.raises(ConfigConfigError, match="'after_model_hooks' must be a list"):
+            builder.build_hooks()
+
+        builder_bad_entry = AgentConfigBuilder({"before_tool_hooks": [123]}, Path(temp_dir), strict=False)
+        builder_bad_entry.build_hooks()  # should not raise
+        assert len(builder_bad_entry._skipped_components) >= 1
+        assert any("before_tool_hooks" in msg for msg in builder_bad_entry._skipped_components)
+        assert builder_bad_entry.agent_params["before_tool_hooks"] == []
+
+    def test_build_hooks_skips_missing_import_field(self, temp_dir):
+        builder = AgentConfigBuilder({"after_tool_hooks": [{"params": {}}]}, Path(temp_dir), strict=False)
+
+        builder.build_hooks()  # should not raise
+        assert len(builder._skipped_components) >= 1
+        assert any("import" in msg for msg in builder._skipped_components)
+        assert builder.agent_params["after_tool_hooks"] == []
+
+    def test_build_hooks_skips_import_errors(self, temp_dir):
+        builder = AgentConfigBuilder({"middlewares": ["nexau.invalid.module:missing"]}, Path(temp_dir), strict=False)
+
+        builder.build_hooks()  # should not raise
+        assert len(builder._skipped_components) >= 1
+        assert any("middleware" in msg.lower() for msg in builder._skipped_components)
+        assert builder.agent_params["middlewares"] == []
+
+    def test_build_hooks_skips_bad_params(self, temp_dir):
+        hook_dict = {"import": f"{MODULE_PATH}:sample_hook_fn", "params": "oops"}
+        builder = AgentConfigBuilder({"after_tool_hooks": [hook_dict]}, Path(temp_dir))
+        with pytest.raises(ConfigConfigError, match="params"):
+            builder.build_hooks()
+
+        class NotCallable:
+            pass
+
+        with patch("nexau.archs.main_sub.config.config.import_from_string", return_value=NotCallable()):
+            hook_dict = {"import": "module:obj", "params": {"x": 1}}
+            builder = AgentConfigBuilder({"before_model_hooks": [hook_dict]}, Path(temp_dir), strict=False)
+
+            builder.build_hooks()  # should not raise
+            assert len(builder._skipped_components) >= 1
+            assert any("callable" in msg.lower() for msg in builder._skipped_components)
+            assert builder.agent_params["before_model_hooks"] == []
+
+    def test_build_tracers_accepts_instances_and_import_strings(self, temp_dir):
+        tracer_import = f"{MODULE_PATH}:ImportableTracer"
+        instance = ConfigDummyTracer()
+        builder = AgentConfigBuilder({"tracers": [instance, tracer_import]}, Path(temp_dir))
+
+        builder.build_tracers()
+
+        tracers = builder.agent_params["tracers"]
+        assert len(tracers) == 2
+        assert isinstance(tracers[0], ConfigDummyTracer)
+        assert isinstance(tracers[1], ImportableTracer)
+
+    def test_build_tracers_skips_invalid_entries(self, temp_dir):
+        builder = AgentConfigBuilder({"tracers": "bad"}, Path(temp_dir))
+        with pytest.raises(ConfigConfigError, match="'tracers' must be a list"):
+            builder.build_tracers()
+
+        builder_bad = AgentConfigBuilder({"tracers": [123]}, Path(temp_dir), strict=False)
+        builder_bad.build_tracers()  # should not raise
+        assert len(builder_bad._skipped_components) >= 1
+        assert any("Tracer" in msg or "tracer" in msg for msg in builder_bad._skipped_components)
+        assert builder_bad.agent_params["tracers"] == []
+
+        builder_not_tracer = AgentConfigBuilder({"tracers": [f"{MODULE_PATH}:sample_hook_fn"]}, Path(temp_dir), strict=False)
+        builder_not_tracer.build_tracers()  # should not raise
+        assert len(builder_not_tracer._skipped_components) >= 1
+        assert any("Tracer" in msg or "tracer" in msg for msg in builder_not_tracer._skipped_components)
+        assert builder_not_tracer.agent_params["tracers"] == []
+
+    def test_build_tracers_skips_null_entry(self, temp_dir):
+        builder = AgentConfigBuilder({"tracers": [None]}, Path(temp_dir), strict=False)
+
+        builder.build_tracers()  # should not raise
+        assert len(builder._skipped_components) >= 1
+        assert any("null" in msg.lower() or "none" in msg.lower() for msg in builder._skipped_components)
+        assert builder.agent_params["tracers"] == []
+
+    def test_build_tracers_skips_import_errors(self, temp_dir):
+        with patch.object(AgentConfigBuilder, "_import_and_instantiate", side_effect=RuntimeError("boom")):
+            builder = AgentConfigBuilder({"tracers": ["module:Tracer"]}, Path(temp_dir), strict=False)
+
+            builder.build_tracers()  # should not raise
+            assert len(builder._skipped_components) >= 1
+            assert any("tracer" in msg.lower() for msg in builder._skipped_components)
+            assert builder.agent_params["tracers"] == []
+
+    def test_build_llm_config_and_token_counter(self, temp_dir):
+        builder = AgentConfigBuilder(
+            {
+                "llm_config": {"model": "gpt-4o-mini"},
+                "token_counter": {"import": f"{MODULE_PATH}:sample_token_counter", "params": {"offset": 2}},
+            },
+            Path(temp_dir),
+        )
+
+        builder.build_llm_config()
+
+        counter = builder.agent_params["token_counter"]
+        assert callable(counter)
+        assert counter([{}, {}]) == 4
+
+    def test_build_llm_config_requires_llm_section(self, temp_dir):
+        builder = AgentConfigBuilder({}, Path(temp_dir))
+
+        with pytest.raises(ConfigConfigError, match="'llm_config' is required"):
+            builder.build_llm_config()
+
+    def test_build_llm_config_rejects_bad_token_counter_params(self, temp_dir):
+        builder = AgentConfigBuilder(
+            {"llm_config": {"model": "gpt-4o-mini"}, "token_counter": {"import": f"{MODULE_PATH}:sample_token_counter", "params": "bad"}},
+            Path(temp_dir),
+        )
+
+        with pytest.raises(ConfigConfigError, match="must be a mapping"):
+            builder.build_llm_config()
+
+    def test_build_system_prompt_path_resolves_relative(self, temp_dir):
+        prompt_file = Path(temp_dir) / "prompt.txt"
+        prompt_file.write_text("hello")
+        builder = AgentConfigBuilder(
+            {"name": "agent", "system_prompt": "prompt.txt", "system_prompt_type": "file"},
+            Path(temp_dir),
+        )
+
+        builder.build_core_properties().build_system_prompt_path()
+
+        assert builder.agent_params["system_prompt"] == str(prompt_file)
+
+    def test_build_system_prompt_path_skips_missing_file(self, temp_dir):
+        builder = AgentConfigBuilder(
+            {"name": "agent", "system_prompt": "missing.txt", "system_prompt_type": "file"},
+            Path(temp_dir),
+            strict=False,
+        )
+
+        builder.build_core_properties()
+        builder.build_system_prompt_path()  # should not raise
+        assert len(builder._skipped_components) >= 1
+        assert any("System prompt file not found" in msg or "missing.txt" in msg for msg in builder._skipped_components)
+        assert builder.agent_params["system_prompt"] == ""
+
+    def test_build_system_prompt_path_list_of_strings(self, temp_dir):
+        """Test path resolution for list[str] system_prompt with file type."""
+        from nexau.archs.main_sub.config.base import SystemPromptBlock
+
+        f1 = Path(temp_dir) / "static.md"
+        f2 = Path(temp_dir) / "dynamic.md"
+        f1.write_text("static")
+        f2.write_text("dynamic")
+
+        builder = AgentConfigBuilder(
+            {"name": "agent", "system_prompt": ["static.md", "dynamic.md"], "system_prompt_type": "file"},
+            Path(temp_dir),
+        )
+
+        builder.build_core_properties().build_system_prompt_path()
+        result = builder.agent_params["system_prompt"]
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert isinstance(result[0], SystemPromptBlock)
+        assert result[0].content == str(f1)
+        assert result[0].cache is True
+        assert isinstance(result[1], SystemPromptBlock)
+        assert result[1].content == str(f2)
+        assert result[1].cache is True
+
+    def test_build_system_prompt_path_list_with_system_prompt_block(self, temp_dir):
+        """Test path resolution for list with SystemPromptBlock entries."""
+        from nexau.archs.main_sub.config.base import SystemPromptBlock
+
+        f1 = Path(temp_dir) / "static.md"
+        f2 = Path(temp_dir) / "dynamic.md"
+        f1.write_text("static content")
+        f2.write_text("dynamic content")
+
+        builder = AgentConfigBuilder(
+            {
+                "name": "agent",
+                "system_prompt": [
+                    SystemPromptBlock(content="static.md", cache=True),
+                    SystemPromptBlock(content="dynamic.md", cache=False),
+                ],
+                "system_prompt_type": "file",
+            },
+            Path(temp_dir),
+        )
+
+        builder.build_core_properties().build_system_prompt_path()
+        result = builder.agent_params["system_prompt"]
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert isinstance(result[0], SystemPromptBlock)
+        assert result[0].content == str(f1)
+        assert result[0].cache is True
+        assert isinstance(result[1], SystemPromptBlock)
+        assert result[1].content == str(f2)
+        assert result[1].cache is False
+
+    def test_build_system_prompt_path_list_skips_missing_file(self, temp_dir):
+        """Test that missing file in list is skipped with warning."""
+        f1 = Path(temp_dir) / "exists.md"
+        f1.write_text("ok")
+
+        builder = AgentConfigBuilder(
+            {"name": "agent", "system_prompt": ["exists.md", "missing.md"], "system_prompt_type": "file"},
+            Path(temp_dir),
+            strict=False,
+        )
+
+        builder.build_core_properties()
+        builder.build_system_prompt_path()  # should not raise
+        assert len(builder._skipped_components) >= 1
+        assert any("System prompt file not found" in msg or "missing.md" in msg for msg in builder._skipped_components)
+        result = builder.agent_params["system_prompt"]
+        assert isinstance(result, list)
+        assert len(result) == 1
+
+    def test_build_system_prompt_path_string_type_skips_resolution(self, temp_dir):
+        """Test that system_prompt_type='string' skips file path resolution for lists."""
+        builder = AgentConfigBuilder(
+            {"name": "agent", "system_prompt": ["inline prompt 1", "inline prompt 2"], "system_prompt_type": "string"},
+            Path(temp_dir),
+        )
+
+        builder.build_core_properties().build_system_prompt_path()
+        result = builder.agent_params["system_prompt"]
+
+        # No path resolution for string type
+        assert result == ["inline prompt 1", "inline prompt 2"]
+
+    def test_build_tools_loads_yaml_and_overrides_name(self, temp_dir):
+        tool_yaml = Path(temp_dir) / "tool.yaml"
+        tool_yaml.write_text(
+            textwrap.dedent(
+                """
+                name: yaml_tool
+                description: Test tool
+                input_schema:
+                  type: object
+                """,
+            ),
+        )
+        builder = AgentConfigBuilder(
+            {"tools": [{"name": "alias_tool", "yaml_path": str(tool_yaml), "binding": "builtins:print"}]},
+            Path(temp_dir),
+        )
+
+        builder.build_tools()
+
+        tool = builder.agent_params["tools"][0]
+        assert isinstance(tool, Tool)
+        assert tool.name == "alias_tool"
+        assert tool.source_name == "yaml_tool"
+
+    def test_build_tools_config_defer_loading_promotes_tool(self, temp_dir):
+        tool_yaml = Path(temp_dir) / "tool.yaml"
+        tool_yaml.write_text(
+            textwrap.dedent(
+                """
+                name: yaml_tool
+                description: Test tool
+                input_schema:
+                  type: object
+                """,
+            ),
+        )
+        builder = AgentConfigBuilder(
+            {
+                "tools": [
+                    {
+                        "name": "yaml_tool",
+                        "yaml_path": str(tool_yaml),
+                        "binding": "builtins:print",
+                        "defer_loading": True,
+                    }
+                ]
+            },
+            Path(temp_dir),
+        )
+
+        builder.build_tools()
+
+        tool = builder.agent_params["tools"][0]
+        assert isinstance(tool, Tool)
+        assert tool.defer_loading is True
+
+    def test_build_tools_config_defer_loading_false_overrides_yaml(self, temp_dir):
+        """Explicit defer_loading: false in config overrides YAML defer_loading: true."""
+        tool_yaml = Path(temp_dir) / "tool.yaml"
+        tool_yaml.write_text(
+            textwrap.dedent(
+                """
+                name: yaml_tool
+                description: Test tool
+                defer_loading: true
+                input_schema:
+                  type: object
+                """,
+            ),
+        )
+        builder = AgentConfigBuilder(
+            {
+                "tools": [
+                    {
+                        "name": "yaml_tool",
+                        "yaml_path": str(tool_yaml),
+                        "binding": "builtins:print",
+                        "defer_loading": False,
+                    }
+                ]
+            },
+            Path(temp_dir),
+        )
+
+        builder.build_tools()
+
+        tool = builder.agent_params["tools"][0]
+        assert isinstance(tool, Tool)
+        assert tool.defer_loading is False
+
+    def test_build_tools_skips_non_bool_defer_loading(self, temp_dir):
+        tool_yaml = Path(temp_dir) / "tool.yaml"
+        tool_yaml.write_text(
+            textwrap.dedent(
+                """
+                name: yaml_tool
+                description: Test tool
+                input_schema:
+                  type: object
+                """,
+            ),
+        )
+        builder = AgentConfigBuilder(
+            {
+                "tools": [
+                    {
+                        "name": "yaml_tool",
+                        "yaml_path": str(tool_yaml),
+                        "binding": "builtins:print",
+                        "defer_loading": "yes",
+                    }
+                ]
+            },
+            Path(temp_dir),
+            strict=False,
+        )
+
+        builder.build_tools()  # should not raise
+        assert len(builder._skipped_components) >= 1
+        assert any("defer_loading" in msg for msg in builder._skipped_components)
+        assert builder.agent_params["tools"] == []
+
+    def test_build_tools_skips_reserved_extra_kwargs(self, temp_dir):
+        tool_yaml = Path(temp_dir) / "tool.yaml"
+        tool_yaml.write_text(
+            textwrap.dedent(
+                """
+                name: yaml_tool
+                description: Test tool
+                input_schema:
+                  type: object
+                """,
+            ),
+        )
+        builder = AgentConfigBuilder(
+            {
+                "tools": [
+                    {
+                        "name": "alias_tool",
+                        "yaml_path": str(tool_yaml),
+                        "binding": "builtins:print",
+                        "extra_kwargs": {"agent_state": "bad"},
+                    }
+                ]
+            },
+            Path(temp_dir),
+            strict=False,
+        )
+
+        builder.build_tools()  # should not raise
+        assert len(builder._skipped_components) >= 1
+        assert any("reserved" in msg.lower() for msg in builder._skipped_components)
+        assert builder.agent_params["tools"] == []
+
+    def test_build_tools_skips_missing_yaml_path(self, temp_dir):
+        builder = AgentConfigBuilder({"tools": [{"name": "missing"}]}, Path(temp_dir), strict=False)
+
+        builder.build_tools()  # should not raise
+        assert len(builder._skipped_components) >= 1
+        assert any("yaml_path" in msg for msg in builder._skipped_components)
+        assert builder.agent_params["tools"] == []
+
+    def test_build_tools_skips_load_errors(self, temp_dir):
+        tool_yaml = Path(temp_dir) / "tool.yaml"
+        tool_yaml.write_text(
+            textwrap.dedent(
+                """
+                name: yaml_tool
+                description: Test tool
+                input_schema:
+                  type: object
+                """,
+            ),
+        )
+        with patch("nexau.archs.main_sub.config.config.Tool.from_yaml", side_effect=ValueError("boom")):
+            builder = AgentConfigBuilder({"tools": [{"name": "alias_tool", "yaml_path": str(tool_yaml)}]}, Path(temp_dir), strict=False)
+
+            builder.build_tools()  # should not raise
+            assert len(builder._skipped_components) >= 1
+            assert any("alias_tool" in msg or "tool" in msg.lower() for msg in builder._skipped_components)
+            assert builder.agent_params["tools"] == []
+
+    def test_build_skills_from_folders_and_tools(self, temp_dir):
+        skill_folder = Path(temp_dir) / "skill"
+        skill_folder.mkdir()
+        skill_folder.joinpath("SKILL.md").write_text(
+            "---\nname: folder-skill\ndescription: Folder skill\n---\n\nDetails here.\n",
+        )
+
+        tool = Tool(
+            name="skill_tool",
+            description="desc",
+            input_schema={"type": "object"},
+            implementation=lambda: None,
+            as_skill=True,
+            skill_description="Use me as a skill",
+        )
+        builder = AgentConfigBuilder({"skills": [str(skill_folder)], "tool_call_mode": "openai"}, Path(temp_dir))
+        builder.agent_params["tools"] = [tool]
+
+        builder.build_skills()
+
+        skills = builder.agent_params["skills"]
+        assert {s.name for s in skills} == {"folder-skill", "skill_tool"}
+        tool_skill = next(s for s in skills if s.name == "skill_tool")
+        assert "## Detailed Description" in (tool_skill.detail or "")
+
+    def test_build_skills_skips_invalid_folder(self, temp_dir):
+        builder = AgentConfigBuilder({"skills": [str(Path(temp_dir) / "missing")]}, Path(temp_dir), strict=False)
+
+        builder.build_skills()  # should not raise
+        assert len(builder._skipped_components) >= 1
+        assert any("skill" in msg.lower() for msg in builder._skipped_components)
+        assert builder.agent_params["skills"] == []
+
+    def test_build_sub_agents_uses_agent_config_from_yaml(self, temp_dir):
+        sub_path = Path(temp_dir) / "child.yaml"
+        sub_path.write_text("name: child\nllm_config:\n  model: gpt-4o-mini\n")
+
+        with patch("nexau.archs.main_sub.config.config.AgentConfig.from_yaml") as mock_from_yaml:
+            mock_from_yaml.return_value = AgentConfig(name="child")
+            builder = AgentConfigBuilder({"sub_agents": [{"name": "child", "config_path": str(sub_path)}]}, Path(temp_dir))
+
+            builder.build_sub_agents()
+
+            assert "child" in builder.agent_params["sub_agents"]
+            mock_from_yaml.assert_called_once()
+
+    def test_build_sub_agents_skips_errors(self, temp_dir):
+        sub_path = Path(temp_dir) / "child.yaml"
+        sub_path.write_text("name: child\n")
+
+        with patch("nexau.archs.main_sub.config.config.AgentConfig.from_yaml", side_effect=ConfigConfigError("boom")):
+            builder = AgentConfigBuilder({"sub_agents": [{"name": "child", "config_path": str(sub_path)}]}, Path(temp_dir), strict=False)
+            builder.build_sub_agents()  # should not raise
+            assert len(builder._skipped_components) >= 1
+            assert any("child" in msg for msg in builder._skipped_components)
+
+    def test_build_skills_pkg_resource(self, temp_dir):
+        """pkg:resource skill paths are resolved via _resolve_config_path."""
+        from nexau.archs.main_sub.skill import Skill
+
+        skill_folder = Path(temp_dir) / "resolved_skill"
+        skill_folder.mkdir()
+        skill_folder.joinpath("SKILL.md").write_text(
+            "---\nname: pkg-skill\ndescription: Pkg skill\n---\nDetails.\n",
+        )
+
+        mock_skill = MagicMock(spec=Skill)
+        mock_skill.name = "pkg-skill"
+
+        with (
+            patch(
+                "nexau.archs.main_sub.config.config._resolve_config_path",
+                return_value=skill_folder,
+            ) as mock_resolve,
+            patch(
+                "nexau.archs.main_sub.config.config.Skill.from_folder",
+                return_value=mock_skill,
+            ),
+        ):
+            builder = AgentConfigBuilder(
+                {"skills": ["my_pkg:skills/test_skill"]},
+                Path(temp_dir),
+            )
+            builder.build_skills()
+
+            mock_resolve.assert_called_once_with("my_pkg:skills/test_skill", Path(temp_dir))
+            assert mock_skill in builder.agent_params["skills"]
+
+    def test_build_sub_agents_pkg_resource(self, temp_dir):
+        """pkg:resource config_path for sub-agents is resolved via _resolve_config_resource."""
+        from contextlib import nullcontext
+
+        resolved_path = Path(temp_dir) / "resolved_sub.yaml"
+
+        with (
+            patch(
+                "nexau.archs.main_sub.config.config._resolve_config_resource",
+                return_value=nullcontext(resolved_path),
+            ) as mock_resolve,
+            patch(
+                "nexau.archs.main_sub.config.config.AgentConfig.from_yaml",
+                return_value=AgentConfig(name="sub"),
+            ) as mock_from_yaml,
+        ):
+            builder = AgentConfigBuilder(
+                {"sub_agents": [{"name": "sub", "config_path": "my_pkg:agents/sub.yaml"}]},
+                Path(temp_dir),
+            )
+            builder.build_sub_agents()
+
+            mock_resolve.assert_called_once_with("my_pkg:agents/sub.yaml", Path(temp_dir))
+            mock_from_yaml.assert_called_once_with(
+                resolved_path,
+                None,
+                options=AgentConfigLoadOptions(strict=True, expand_plugins=False),
+            )
+            assert "sub" in builder.agent_params["sub_agents"]
+
+    def test_build_system_prompt_path_pkg_resource_single(self, temp_dir):
+        """Single pkg:resource system_prompt path is resolved correctly."""
+        prompt_file = Path(temp_dir) / "resolved_prompt.md"
+        prompt_file.write_text("system prompt content")
+
+        with patch(
+            "nexau.archs.main_sub.config.config._resolve_config_path",
+            return_value=prompt_file,
+        ) as mock_resolve:
+            builder = AgentConfigBuilder(
+                {"name": "agent", "system_prompt": "my_pkg:prompts/system.md", "system_prompt_type": "file"},
+                Path(temp_dir),
+            )
+            builder.build_core_properties().build_system_prompt_path()
+
+            mock_resolve.assert_called_once_with("my_pkg:prompts/system.md", Path(temp_dir))
+            assert builder.agent_params["system_prompt"] == str(prompt_file)
+
+    def test_build_system_prompt_path_pkg_resource_list(self, temp_dir):
+        """List of pkg:resource system_prompt paths are resolved correctly."""
+        from nexau.archs.main_sub.config.base import SystemPromptBlock
+
+        f1 = Path(temp_dir) / "a.md"
+        f2 = Path(temp_dir) / "b.md"
+        f1.write_text("prompt a")
+        f2.write_text("prompt b")
+
+        def resolve_side_effect(raw_path: str, base_path: Path) -> Path:
+            mapping = {
+                "my_pkg:prompts/a.md": f1,
+                "my_pkg:prompts/b.md": f2,
+            }
+            return mapping[raw_path]
+
+        with patch(
+            "nexau.archs.main_sub.config.config._resolve_config_path",
+            side_effect=resolve_side_effect,
+        ):
+            builder = AgentConfigBuilder(
+                {
+                    "name": "agent",
+                    "system_prompt": ["my_pkg:prompts/a.md", "my_pkg:prompts/b.md"],
+                    "system_prompt_type": "file",
+                },
+                Path(temp_dir),
+            )
+            builder.build_core_properties().build_system_prompt_path()
+
+        result = builder.agent_params["system_prompt"]
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert isinstance(result[0], SystemPromptBlock)
+        assert result[0].content == str(f1)
+        assert isinstance(result[1], SystemPromptBlock)
+        assert result[1].content == str(f2)
+
+    def test_load_tool_from_config_pkg_resource(self, temp_dir):
+        """Tool yaml_path with pkg:resource format is resolved via _resolve_config_path."""
+        tool_yaml = Path(temp_dir) / "resolved_tool.yaml"
+        tool_yaml.write_text(
+            textwrap.dedent(
+                """
+                name: pkg_tool
+                description: Tool from package
+                input_schema:
+                  type: object
+                """,
+            ),
+        )
+
+        with patch(
+            "nexau.archs.main_sub.config.config._resolve_config_path",
+            return_value=tool_yaml,
+        ) as mock_resolve:
+            builder = AgentConfigBuilder(
+                {"tools": [{"name": "pkg_tool", "yaml_path": "my_pkg:tools/tool.yaml", "binding": "builtins:print"}]},
+                Path(temp_dir),
+            )
+            builder.build_tools()
+
+            mock_resolve.assert_called_once_with("my_pkg:tools/tool.yaml", Path(temp_dir))
+
+        tool = builder.agent_params["tools"][0]
+        assert isinstance(tool, Tool)
+        assert tool.name == "pkg_tool"
+
+
+class TestExecutionConfig:
+    """Lightweight validation of ExecutionConfig wiring."""
+
+    def test_execution_config_normalizes_tool_call_mode(self):
+        cfg = ExecutionConfig(tool_call_mode="OPENAI")
+        assert cfg.tool_call_mode == "structured"
+
+    def test_execution_config_from_agent_config_copies_values(self):
+        agent_cfg = AgentConfig(
+            name="agent",
+            max_iterations=5,
+            max_context_tokens=10,
+            max_running_subagents=1,
+            retry_attempts=2,
+            retry_backoff_max_seconds=9,
+            timeout=3,
+        )
+        exec_cfg = ExecutionConfig.from_agent_config(agent_cfg)
+
+        assert exec_cfg.max_iterations == 5
+        assert exec_cfg.max_context_tokens == 10
+        assert exec_cfg.max_running_subagents == 1
+        assert exec_cfg.retry_attempts == 2
+        assert exec_cfg.retry_backoff_max_seconds == 9
+        assert exec_cfg.timeout == 3
+
+
+class TestSkillToolIngestion:
+    """Tests for auto-ingestion of the LoadSkill tool."""
+
+    def test_load_skill_tool_ingested_when_agent_config_contains_skills(self, temp_dir: str) -> None:
+        skill_folder = Path(temp_dir) / "skills" / "my_skill"
+        skill_folder.mkdir(parents=True)
+        skill_folder.joinpath("SKILL.md").write_text(
+            "---\nname: my-skill\ndescription: My test skill\n---\n\nDetails.\n",
+        )
+
+        config_path = Path(temp_dir) / "agent.yaml"
+        config_path.write_text(
+            textwrap.dedent(
+                """
+                type: agent
+                name: skill_agent
+                llm_config:
+                  model: gpt-4o-mini
+                tools: []
+                skills:
+                  - ./skills/my_skill
+                """,
+            ).lstrip(),
+        )
+
+        cfg = AgentConfig.from_yaml(config_path)
+
+        assert [s.name for s in cfg.skills] == ["my-skill"]
+        assert any(t.name == "LoadSkill" for t in cfg.tools)
+
+
+class TestResolveConfigPath:
+    """Tests for _resolve_config_path helper."""
+
+    def test_resolve_config_path_absolute(self):
+        """Absolute paths are returned as-is without joining base_path."""
+        from nexau.archs.main_sub.config.config import _resolve_config_path
+
+        result = _resolve_config_path("/absolute/path.yaml", Path("/some/base"))
+
+        assert result == Path("/absolute/path.yaml")
+
+    def test_resolve_config_path_relative(self, temp_dir):
+        """Relative paths are resolved against base_path."""
+        from nexau.archs.main_sub.config.config import _resolve_config_path
+
+        result = _resolve_config_path("relative/path.yaml", Path(temp_dir))
+
+        assert result == Path(temp_dir) / "relative/path.yaml"
+
+    def test_resolve_config_path_pkg_resource(self):
+        """pkg:resource format resolves through importlib.resources.files."""
+        from nexau.archs.main_sub.config.config import _resolve_config_path
+
+        mock_traversable = MagicMock()
+        mock_traversable.joinpath.return_value = "/fake/pkg/resource/path.yaml"
+
+        with patch("importlib.resources.files", return_value=mock_traversable) as mock_files:
+            result = _resolve_config_path("some_pkg:resource/path.yaml", Path("/base"))
+
+        mock_files.assert_called_once_with("some_pkg")
+        mock_traversable.joinpath.assert_called_once_with("resource/path.yaml")
+        assert result == Path("/fake/pkg/resource/path.yaml")
+
+    def test_resolve_config_path_windows_absolute(self):
+        """Windows absolute paths (containing ':') are not misinterpreted as pkg:resource."""
+        from nexau.archs.main_sub.config.config import _resolve_config_path
+
+        with patch.object(Path, "is_absolute", return_value=True):
+            result = _resolve_config_path("C:\\Users\\path.yaml", Path("/base"))
+
+        assert result == Path("C:\\Users\\path.yaml")
+
+
+class TestResolveConfigResource:
+    """Tests for _resolve_config_resource context-manager helper."""
+
+    def test_absolute_path_yields_unchanged(self):
+        """Absolute paths are yielded as-is without joining base_path."""
+        from nexau.archs.main_sub.config.config import _resolve_config_resource
+
+        with _resolve_config_resource("/absolute/path.yaml", Path("/some/base")) as result:
+            assert result == Path("/absolute/path.yaml")
+
+    def test_relative_path_yields_resolved(self, temp_dir):
+        """Relative paths are resolved against base_path."""
+        from nexau.archs.main_sub.config.config import _resolve_config_resource
+
+        with _resolve_config_resource("relative/path.yaml", Path(temp_dir)) as result:
+            assert result == Path(temp_dir) / "relative/path.yaml"
+
+    def test_pkg_resource_delegates_to_as_file(self):
+        """pkg:resource format uses importlib.resources.as_file for materialisation."""
+        from nexau.archs.main_sub.config.config import _resolve_config_resource
+
+        mock_traversable = MagicMock()
+        mock_traversable.joinpath.return_value = MagicMock(name="joined_resource")
+
+        mock_real_path = Path("/tmp/materialised/resource.yaml")
+
+        with (
+            patch("importlib.resources.files", return_value=mock_traversable) as mock_files,
+            patch("importlib.resources.as_file") as mock_as_file,
+        ):
+            mock_as_file.return_value.__enter__ = MagicMock(return_value=mock_real_path)
+            mock_as_file.return_value.__exit__ = MagicMock(return_value=False)
+
+            with _resolve_config_resource("some_pkg:resource/path.yaml", Path("/base")) as result:
+                assert result == mock_real_path
+
+            mock_files.assert_called_once_with("some_pkg")
+            mock_traversable.joinpath.assert_called_once_with("resource/path.yaml")
+            mock_as_file.assert_called_once_with(mock_traversable.joinpath.return_value)
+
+    def test_pkg_resource_cleanup_called(self):
+        """as_file context manager __exit__ is invoked after the with-block."""
+        from nexau.archs.main_sub.config.config import _resolve_config_resource
+
+        mock_traversable = MagicMock()
+        mock_cm = MagicMock()
+        mock_cm.__enter__ = MagicMock(return_value=Path("/tmp/temp_resource.yaml"))
+        mock_cm.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch("importlib.resources.files", return_value=mock_traversable),
+            patch("importlib.resources.as_file", return_value=mock_cm),
+        ):
+            with _resolve_config_resource("pkg:res.yaml", Path("/base")):
+                # Inside the context, __exit__ has NOT been called yet
+                mock_cm.__exit__.assert_not_called()
+
+            # After the context, __exit__ must have been called
+            mock_cm.__exit__.assert_called_once()
+
+    def test_windows_absolute_not_misinterpreted(self):
+        """Windows absolute paths (containing ':') are not treated as pkg:resource."""
+        from nexau.archs.main_sub.config.config import _resolve_config_resource
+
+        with patch.object(Path, "is_absolute", return_value=True):
+            with _resolve_config_resource("C:\\Users\\path.yaml", Path("/base")) as result:
+                assert result == Path("C:\\Users\\path.yaml")

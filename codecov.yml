@@ -1,0 +1,87 @@
+# Codecov configuration — PR feedback & coverage gates.
+#
+# Docs: https://docs.codecov.com/docs/codecov-yaml
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto     # Compare against base commit
+        threshold: 1%    # Allow up to 1% drop before failing
+    patch:
+      default:
+        target: 80%      # New/changed lines should have ≥80% coverage
+
+  # Ignore paths that inflate/deflate coverage unfairly
+  ignore:
+    - "nexau/cli/**"             # CLI wrappers, hard to unit-test
+    - "nexau/archs/transports/grpc/**"  # Generated / low-priority
+    - "nexau/archs/transports/websocket/**"
+
+comment:
+  layout: "header, diff, flags, components, files"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: true
+  hide_project_coverage: false
+
+# Flag definitions — match CI upload flags
+flags:
+  unittests-saas:
+    paths:
+      - nexau/
+    carryforward: true   # Keep previous result if flag not uploaded in this commit
+  unittests-selfhost:
+    paths:
+      - nexau/
+    carryforward: true
+  unittests-migrations-pg:
+    # Postgres-only alembic migration suite (test-migrations-pg job). The
+    # SQLite path of the same tests is in unittests-saas; this flag covers
+    # the PG-only branches (downgrade DDL, partial unique index WHERE
+    # clause, type dispatch differences). Carryforward so the union with
+    # unittests-saas is the patch coverage shown on PRs.
+    paths:
+      - nexau/db/
+    carryforward: true
+  unittests-nightly:
+    # Live-LLM tests excluded from PR loop (``@pytest.mark.llm`` and
+    # ``live_nightly``). Uploaded by .github/workflows/nightly.yml on
+    # the daily schedule. Carryforward is load-bearing: every PR's
+    # codecov total = its own ``unittests-saas`` + the most recent
+    # successful ``unittests-nightly``. Without this, the ~3% of code
+    # only reachable via live LLM (provider routing edges, async
+    # dispatch, sub-agent invocation) would look uncovered on every
+    # PR even though nightly verifies it.
+    paths:
+      - nexau/
+    carryforward: true
+
+# Component-level tracking — shows per-module coverage changes in PR comment
+component_management:
+  default_rules:
+    statuses:
+      - type: project
+        target: auto
+  individual_components:
+    - component_id: agent-system
+      name: Agent System
+      paths:
+        - nexau/archs/main_sub/**
+    - component_id: tool-system
+      name: Tool System
+      paths:
+        - nexau/archs/tool/**
+    - component_id: llm-aggregators
+      name: LLM Aggregators
+      paths:
+        - nexau/archs/llm/**
+    - component_id: session
+      name: Session
+      paths:
+        - nexau/archs/session/**
+    - component_id: transports
+      name: Transports
+      paths:
+        - nexau/archs/transports/**

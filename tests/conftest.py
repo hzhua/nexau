@@ -1,0 +1,622 @@
+# Copyright (c) Nex-AGI. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Pytest configuration and fixtures for nexau framework tests.
+
+This module provides shared fixtures, configuration, and utilities
+for all tests in the nexau test suite.
+"""
+
+import asyncio
+import os
+import shutil
+import tempfile
+import types
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import dotenv
+import pytest
+import yaml
+
+from tests.utils.platform import (
+    TestPlatform,
+    build_test_output_dir_root,
+    build_test_script_dir_root,
+    default_python_command,
+    detect_test_platform,
+)
+
+# Load .env BEFORE importing nexau modules (they may read env vars during init)
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.environ.get("PYTHON_DOTENV_DISABLED", "").lower() not in {"1", "true", "yes"}:
+    dotenv.load_dotenv(os.path.join(_project_root, ".env"), override=True)
+
+# Provide a lightweight anthropic stub for environments without the package
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Ensure clean exit after tests complete.
+
+    Orphaned non-daemon threads (e.g. aiosqlite worker threads) can block
+    normal process shutdown indefinitely.  Schedule a forced exit on a
+    daemon thread so the process terminates with the correct exit code
+    after a short grace period.
+
+    Individual test hangs are already caught by pytest-timeout (--timeout).
+    """
+    import threading
+    import time
+
+    def _force_exit():
+        time.sleep(5)
+        os._exit(exitstatus)
+
+    threading.Thread(target=_force_exit, daemon=True).start()
+
+
+def _load_nexau_dependencies():
+    from nexau.archs.llm.llm_config import LLMConfig as _LLMConfig
+    from nexau.archs.main_sub.agent import Agent as _Agent
+    from nexau.archs.main_sub.agent_context import AgentContext as _AgentContext
+    from nexau.archs.main_sub.agent_context import GlobalStorage as _GlobalStorage
+    from nexau.archs.main_sub.agent_state import AgentState as _AgentState
+    from nexau.archs.main_sub.config import AgentConfig as _AgentConfig
+    from nexau.archs.main_sub.config import ExecutionConfig as _ExecutionConfig
+    from nexau.archs.tool.tool import Tool as _Tool
+
+    return (
+        _LLMConfig,
+        _Agent,
+        _AgentContext,
+        _GlobalStorage,
+        _AgentState,
+        _AgentConfig,
+        _ExecutionConfig,
+        _Tool,
+    )
+
+
+(
+    LLMConfig,
+    Agent,
+    AgentContext,
+    GlobalStorage,
+    AgentState,
+    AgentConfig,
+    ExecutionConfig,
+    Tool,
+) = _load_nexau_dependencies()
+
+
+# Test configuration
+@pytest.fixture
+def test_config(tmp_path):
+    """Global test configuration."""
+    return {
+        "test_data_dir": Path(__file__).parent / "test_data",
+        "temp_dir": tmp_path / "temp",
+        "mock_llm_responses": True,
+        "enable_external_apis": False,
+    }
+
+
+@pytest.fixture(autouse=True)
+def setup_test_environment(test_config, request):
+    """Set up test environment for all tests."""
+    # Create test directories
+    test_config["test_data_dir"].mkdir(exist_ok=True)
+    test_config["temp_dir"].mkdir(exist_ok=True)
+
+    # Set environment variables for testing (skip LLM_* defaults for tests marked llm - they use .env)
+    os.environ.setdefault("TESTING", "true")
+    if request.node.get_closest_marker("llm") is None:
+        os.environ.setdefault("LLM_MODEL", "gpt-4o-mini")
+        os.environ.setdefault("LLM_BASE_URL", "https://api.openai.com/v1")
+        os.environ.setdefault("LLM_API_KEY", "test-key-not-used")
+
+    yield
+
+
+# LLM Configuration Fixtures
+@pytest.fixture
+def mock_llm_config():
+    """Mock LLM configuration for testing."""
+    return LLMConfig(
+        model="gpt-4o-mini",
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        temperature=0.1,
+        max_tokens=1000,
+        api_type="openai_chat_completion",
+    )
+
+
+@pytest.fixture
+def responses_llm_config():
+    """LLM config configured for the Responses API."""
+    return LLMConfig(
+        model="gpt-4o-mini",
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        temperature=0.1,
+        max_tokens=1000,
+        api_type="openai_responses",
+    )
+
+
+@pytest.fixture
+def real_llm_config():
+    """Real LLM configuration using environment variables."""
+    try:
+        return LLMConfig()  # Will use environment variables
+    except ValueError:
+        pytest.skip("Real LLM credentials not available")
+
+
+# Agent Context and State Fixtures
+@pytest.fixture
+def global_storage():
+    """Global storage instance for testing."""
+    return GlobalStorage()
+
+
+@pytest.fixture
+def agent_context():
+    """Agent context for testing."""
+    return AgentContext({"test": "value"})
+
+
+@pytest.fixture
+def agent_state(mock_llm_config, global_storage, agent_context):
+    """Agent state for testing."""
+    from nexau.archs.tool.tool_registry import ToolRegistry
+
+    return AgentState(
+        agent_name="test_agent",
+        agent_id="test_agent_123",
+        run_id="run_123",
+        root_run_id="run_123",
+        context=agent_context,
+        global_storage=global_storage,
+        tool_registry=ToolRegistry(),
+    )
+
+
+# Agent Configuration Fixtures
+@pytest.fixture
+def agent_config(mock_llm_config):
+    """Basic agent configuration for testing."""
+    return AgentConfig(
+        name="test_agent",
+        system_prompt="You are a helpful assistant.",
+        system_prompt_type="string",
+        tools=[],
+        sub_agents={},
+        llm_config=mock_llm_config,
+        stop_tools=set(),
+    )
+
+
+@pytest.fixture
+def execution_config():
+    """Execution configuration for testing."""
+    return ExecutionConfig(
+        max_iterations=10,
+        max_context_tokens=8000,
+        max_running_subagents=3,
+        retry_attempts=2,
+        timeout=60,
+    )
+
+
+# Tool Fixtures
+@pytest.fixture
+def sample_tool():
+    """Sample tool for testing."""
+
+    def sample_function(x: int, y: str = "default") -> dict:
+        return {"result": f"{x}_{y}"}
+
+    return Tool(
+        name="sample_tool",
+        description="A sample tool for testing",
+        input_schema={
+            "type": "object",
+            "properties": {"x": {"type": "integer"}, "y": {"type": "string", "default": "default"}},
+            "required": ["x"],
+        },
+        implementation=sample_function,
+    )
+
+
+@pytest.fixture
+def mock_tools(sample_tool):
+    """List of mock tools for testing."""
+    return [sample_tool]
+
+
+# File and Directory Fixtures
+@pytest.fixture
+def temp_file():
+    """Create a temporary file for testing."""
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
+        f.write("test content")
+        temp_path = f.name
+
+    yield temp_path
+
+    # Cleanup
+    if os.path.exists(temp_path):
+        os.unlink(temp_path)
+
+
+@pytest.fixture
+def temp_dir():
+    """Create a temporary directory for testing."""
+    temp_path = tempfile.mkdtemp()
+
+    yield temp_path
+
+    # Cleanup
+    if os.path.exists(temp_path):
+        shutil.rmtree(temp_path)
+
+
+@pytest.fixture(scope="session")
+def test_platform_runtime() -> TestPlatform:
+    """Detect the current test platform and optional tool availability.
+
+    RFC-0020: 集中承载测试平台差异与可选依赖探测。
+    """
+    return detect_test_platform()
+
+
+@pytest.fixture(scope="session")
+def platform_temp_dir(test_platform_runtime: TestPlatform) -> Path:
+    """Return the host temp directory selected for platform-aware tests."""
+    return test_platform_runtime.temp_dir
+
+
+@pytest.fixture(scope="session")
+def bash_output_dir_root(platform_temp_dir: Path) -> Path:
+    """Return the platform-aware root used for local shell output artifacts in tests."""
+    return build_test_output_dir_root(platform_temp_dir)
+
+
+@pytest.fixture(scope="session")
+def bash_script_dir_root(platform_temp_dir: Path) -> Path:
+    """Return the platform-aware root used for generated script artifacts in tests."""
+    return build_test_script_dir_root(platform_temp_dir)
+
+
+@pytest.fixture(scope="session")
+def git_bash_path(test_platform_runtime: TestPlatform) -> str | None:
+    """Return the optional Git Bash backend path detected for the current platform."""
+    return test_platform_runtime.git_bash_path
+
+
+@pytest.fixture(scope="session")
+def python_command(test_platform_runtime: TestPlatform) -> str:
+    """Return the interpreter command tests should use for the host platform."""
+    return default_python_command(test_platform_runtime.system)
+
+
+@pytest.fixture
+def sample_yaml_config(temp_dir):
+    """Create a sample YAML configuration file."""
+    config = {
+        "name": "test_agent",
+        "system_prompt": "You are a helpful assistant.",
+        "llm_config": {
+            "model": "gpt-4o-mini",
+            "temperature": 0.1,
+        },
+        "tools": [],
+        "max_iterations": 10,
+    }
+
+    config_path = Path(temp_dir) / "test_config.yaml"
+    with open(config_path, "w") as f:
+        yaml.dump(config, f)
+
+    return str(config_path)
+
+
+# Mock External Services
+@pytest.fixture
+def mock_openai_client():
+    """Mock OpenAI client for testing."""
+    mock_client = Mock()
+
+    # Mock chat completions
+    mock_response = Mock()
+    mock_response.choices = [Mock()]
+    mock_response.choices[0].message.content = "Mocked LLM response"
+    mock_response.usage = {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+    mock_client.chat.completions.create.return_value = mock_response
+
+    # Mock Responses API
+    message_item = {
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Mocked LLM response"}],
+    }
+
+    responses_payload = types.SimpleNamespace(
+        output=[message_item],
+        output_text="Mocked LLM response",
+        usage=types.SimpleNamespace(input_tokens=10, output_tokens=20),
+    )
+    mock_client.responses.create.return_value = responses_payload
+
+    return mock_client
+
+
+# Agent Fixtures
+@pytest.fixture
+def mock_agent(mock_llm_config, execution_config, global_storage):
+    """Create a mock agent for testing."""
+    with patch("nexau.archs.main_sub.agent.openai") as mock_openai:
+        mock_openai.OpenAI.return_value = Mock()
+        agent_config = AgentConfig(
+            name="test_agent",
+            llm_config=mock_llm_config,
+            max_iterations=execution_config.max_iterations,
+            max_context_tokens=execution_config.max_context_tokens,
+            global_storage=global_storage,
+        )
+        agent = Agent(config=agent_config)
+        yield agent
+
+
+# Async Fixtures
+@pytest.fixture(scope="function")
+def event_loop():
+    """Create an event loop for async tests."""
+    loop = asyncio.new_event_loop()
+    yield loop
+    # 清理所有未完成的 tasks，防止进程挂起
+    pending = asyncio.all_tasks(loop)
+    for task in pending:
+        task.cancel()
+    if pending:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    loop.close()
+
+
+# Environment Variables for Testing
+@pytest.fixture(autouse=True)
+def mock_env_vars(request):
+    """Mock environment variables for consistent testing.
+
+    For @pytest.mark.llm tests:
+    - Skip if no real LLM_API_KEY is available (CI without secrets)
+    - Otherwise use real .env values
+
+    For other tests: mock all env vars including LLM.
+    """
+    if request.node.get_closest_marker("llm") is not None:
+        # Check if real LLM credentials are available
+        real_api_key = os.environ.get("LLM_API_KEY", "")
+        if not real_api_key or real_api_key == "test-key-not-used":
+            pytest.skip("Skipping @pytest.mark.llm test: no real LLM_API_KEY available")
+        # For @pytest.mark.llm tests with real credentials, only mock non-LLM env vars
+        with patch.dict(
+            os.environ,
+            {
+                "TESTING": "true",
+                "SERPER_API_KEY": "test-serper-key",
+            },
+        ):
+            yield
+    else:
+        # For other tests, mock all env vars including LLM
+        with patch.dict(
+            os.environ,
+            {
+                "TESTING": "true",
+                "LLM_MODEL": "gpt-4o-mini",
+                "LLM_BASE_URL": "https://api.openai.com/v1",
+                "LLM_API_KEY": "test-key-not-used",
+                "SERPER_API_KEY": "test-serper-key",
+            },
+        ):
+            yield
+
+
+# Test Data Fixtures
+@pytest.fixture
+def sample_conversation():
+    """Sample conversation data for testing."""
+    return [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello, how are you?"},
+        {"role": "assistant", "content": "I am doing well, thank you for asking."},
+    ]
+
+
+@pytest.fixture
+def sample_tool_call():
+    """Sample tool call data for testing."""
+    return {
+        "tool_name": "sample_tool",
+        "parameters": {"x": 42, "y": "test"},
+    }
+
+
+# Error Simulation Fixtures
+@pytest.fixture
+def mock_llm_error():
+    """Mock LLM error for testing error handling."""
+    return Exception("Mock LLM API error")
+
+
+@pytest.fixture
+def mock_tool_error():
+    """Mock tool error for testing error handling."""
+    return Exception("Mock tool execution error")
+
+
+# Configuration Loading Fixtures
+@pytest.fixture
+def valid_agent_config_dict():
+    """Valid agent configuration dictionary."""
+    return {
+        "name": "test_agent",
+        "system_prompt": "You are a helpful assistant.",
+        "llm_config": {
+            "model": "gpt-4o-mini",
+            "temperature": 0.1,
+            "max_tokens": 1000,
+        },
+        "tools": [],
+        "max_iterations": 10,
+    }
+
+
+@pytest.fixture
+def invalid_agent_config_dict():
+    """Invalid agent configuration dictionary."""
+    return {
+        "name": "",  # Invalid: empty name
+        "llm_config": {
+            "model": "",  # Invalid: empty model
+        },
+    }
+
+
+# Test Utilities
+@pytest.fixture
+def assert_mock_calls():
+    """Utility fixture for asserting mock calls."""
+
+    def _assert_mock_calls(mock_obj, expected_calls):
+        mock_obj.assert_has_calls(expected_calls)
+        assert mock_obj.call_count == len(expected_calls)
+
+    return _assert_mock_calls
+
+
+# Performance and Load Testing Fixtures
+@pytest.fixture
+def performance_config():
+    """Configuration for performance testing."""
+    return {
+        "min_response_time": 0.1,
+        "max_response_time": 5.0,
+        "max_memory_mb": 100,
+    }
+
+
+# Skip Conditions
+def pytest_configure(config):
+    """Configure pytest with custom markers."""
+    config.addinivalue_line("markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')")
+    config.addinivalue_line("markers", "integration: marks tests as integration tests")
+    config.addinivalue_line("markers", "e2e: marks tests as end-to-end tests")
+    config.addinivalue_line("markers", "external: marks tests that require external services")
+    config.addinivalue_line("markers", "llm: marks tests that require LLM services")
+    config.addinivalue_line("markers", "windows_only: marks tests that only run on Windows")
+    config.addinivalue_line("markers", "posix_only: marks tests that only run on POSIX systems")
+    config.addinivalue_line(
+        "markers",
+        "requires_git_bash: marks tests that require the optional Git Bash backend or a bash executable",
+    )
+    config.addinivalue_line("markers", "requires_rg: marks tests that require ripgrep (rg)")
+    config.addinivalue_line("markers", "requires_ffmpeg: marks tests that require ffmpeg")
+    config.addinivalue_line(
+        "markers",
+        "live_nightly: marks live tests deferred from per-PR CI to a nightly run (drift detection only)",
+    )
+
+
+# Configure anyio to only use asyncio backend (trio is not installed)
+@pytest.fixture
+def anyio_backend():
+    """Configure anyio to use asyncio backend."""
+    return "asyncio"
+
+
+# Per-provider basic-streaming smoke kept on every PR; the rest of
+# ``test_aggregator_live_e2e.py`` is auto-marked ``live_nightly`` and
+# only runs in the nightly workflow.
+_AGGREGATOR_LIVE_SMOKE = frozenset(
+    {
+        "test_openai_chat_streaming_e2e_northgate_gpt52",
+        "test_openai_responses_streaming_e2e_northgate_gpt52",
+        "test_anthropic_streaming_e2e_northgate_sonnet45",
+        "test_gemini_rest_streaming_e2e_gateway_31pro",
+    }
+)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Modify test collection to add markers automatically."""
+    platform_runtime = detect_test_platform()
+    run_live_llm = os.environ.get("NEXAU_RUN_LIVE_LLM_TESTS") == "1"
+    skip_llm = pytest.mark.skip(reason="live LLM test; set NEXAU_RUN_LIVE_LLM_TESTS=1 to run")
+
+    for item in items:
+        explicit_llm_marker = item.get_closest_marker("llm") is not None
+
+        # Add slow marker to tests that take longer
+        if "performance" in item.name or "load" in item.name:
+            item.add_marker(pytest.mark.slow)
+
+        # Add integration marker to integration tests
+        if "integration" in str(item.fspath):
+            item.add_marker(pytest.mark.integration)
+
+        # Add e2e marker to e2e tests
+        if "e2e" in str(item.fspath):
+            item.add_marker(pytest.mark.e2e)
+
+        # Add external marker to tests that might need external services
+        if any(keyword in item.name for keyword in ["web", "search", "api", "external"]):
+            item.add_marker(pytest.mark.external)
+
+        # Add llm marker to tests that use LLM services
+        if any(keyword in item.name for keyword in ["llm", "openai", "chat"]):
+            item.add_marker(pytest.mark.llm)
+
+        if explicit_llm_marker and not run_live_llm:
+            item.add_marker(skip_llm)
+
+        # Auto-mark every live test in test_aggregator_live_e2e.py as
+        # ``live_nightly`` EXCEPT the 4 per-provider basic-streaming
+        # smoke tests. Per-PR CI deselects ``live_nightly`` to keep
+        # test-saas fast; the nightly workflow runs everything.
+        # Single source of truth lives here so the smoke allowlist
+        # doesn't drift from the test file via decorator rot.
+        if "test_aggregator_live_e2e.py" in str(item.fspath) and item.name not in _AGGREGATOR_LIVE_SMOKE:
+            item.add_marker(pytest.mark.live_nightly)
+
+        # RFC-0020: 集中处理平台与可选依赖 gate，避免在测试中散落 skipif
+        if item.get_closest_marker("windows_only") is not None and not platform_runtime.is_windows:
+            item.add_marker(pytest.mark.skip(reason="windows_only test requires Windows host"))
+
+        if item.get_closest_marker("posix_only") is not None and not platform_runtime.is_posix:
+            item.add_marker(pytest.mark.skip(reason="posix_only test requires a POSIX host"))
+
+        if item.get_closest_marker("requires_git_bash") is not None and platform_runtime.git_bash_path is None:
+            item.add_marker(pytest.mark.skip(reason="requires_git_bash test requires optional Git Bash / bash executable"))
+
+        if item.get_closest_marker("requires_rg") is not None and platform_runtime.rg_path is None:
+            item.add_marker(pytest.mark.skip(reason="requires_rg test could not find ripgrep (rg)"))
+
+        if item.get_closest_marker("requires_ffmpeg") is not None and platform_runtime.ffmpeg_path is None:
+            item.add_marker(pytest.mark.skip(reason="requires_ffmpeg test could not find ffmpeg"))

@@ -1,0 +1,579 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  # Manual trigger so stacked PRs (whose base is another feature branch,
+  # not main/develop) can opt into CI on demand. Use:
+  #   gh workflow run "CI" --ref <branch-name>
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - &setup-python
+      name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - &install-uv
+      name: Install uv
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - &install-deps
+      name: Install dependencies
+      run: |
+        uv sync
+
+    - name: Run lint suite
+      run: |
+        uv run ruff check .
+        make format-check
+
+  typecheck:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - *setup-python
+    - *install-uv
+    - *install-deps
+
+    - name: Run mypy (generate type coverage reports)
+      run: |
+        make mypy-coverage
+
+    - name: Run pyright
+      run: |
+        make pyright
+
+    # - name: Upload type coverage to Codecov
+    #   uses: codecov/codecov-action@v5
+    #   with:
+    #     name: type-coverage
+    #     files: ./mypy_reports/type_cobertura/cobertura.xml
+    #     flags: typecov
+    #     verbose: true
+    #     use_oidc: true
+    #   env:
+    #     CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    - name: Upload type coverage HTML
+      uses: actions/upload-artifact@v4
+      with:
+        name: type-coverage-html
+        path: mypy_reports/type_html/
+
+  windows-quality:
+    name: windows-quality
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - *setup-python
+    - name: Install uv (Windows)
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        irm https://astral.sh/uv/install.ps1 | iex
+        $uvDir = @(
+          "$env:USERPROFILE\.local\bin"
+          "$env:USERPROFILE\.cargo\bin"
+        ) | Where-Object { Test-Path (Join-Path $_ 'uv.exe') } | Select-Object -First 1
+        if (-not $uvDir) {
+          throw "uv.exe was not installed to an expected user bin directory."
+        }
+        $uvDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - *install-deps
+    - name: Verify default Windows shell backend
+      shell: pwsh
+      run: |
+        $script = @'
+        from nexau.archs.platform.shell_backend import ensure_default_windows_shell
+
+        inst = ensure_default_windows_shell()
+        print(
+            "default Windows shell backend: "
+            f"kind={inst.kind} path={inst.executable_path} "
+            f"source={inst.source} version={inst.version}"
+        )
+        '@
+        $script | uv run python -
+
+    - name: Show Python version
+      shell: pwsh
+      run: python --version
+
+    - name: Show uv version
+      shell: pwsh
+      run: uv --version
+
+    - name: Show Node.js version
+      shell: pwsh
+      run: node --version
+
+    - name: Show npm version
+      shell: pwsh
+      run: npm --version
+
+    - name: Run ruff check
+      shell: pwsh
+      run: uv run ruff check .
+
+    - name: Run ruff format check
+      shell: pwsh
+      run: uv run ruff format --check
+
+    - name: Run mypy on Windows
+      shell: pwsh
+      run: uv run mypy --config-file pyproject.toml .
+
+    - name: Run pyright on Windows
+      shell: pwsh
+      run: uv run pyright
+
+  windows-target-tests:
+    name: windows-target-tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - *setup-python
+    - name: Install uv (Windows)
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        irm https://astral.sh/uv/install.ps1 | iex
+        $uvDir = @(
+          "$env:USERPROFILE\.local\bin"
+          "$env:USERPROFILE\.cargo\bin"
+        ) | Where-Object { Test-Path (Join-Path $_ 'uv.exe') } | Select-Object -First 1
+        if (-not $uvDir) {
+          throw "uv.exe was not installed to an expected user bin directory."
+        }
+        $uvDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+    - *install-deps
+    - name: Verify default Windows shell backend
+      shell: pwsh
+      run: |
+        $script = @'
+        from nexau.archs.platform.shell_backend import ensure_default_windows_shell
+
+        inst = ensure_default_windows_shell()
+        print(
+            "default Windows shell backend: "
+            f"kind={inst.kind} path={inst.executable_path} "
+            f"source={inst.source} version={inst.version}"
+        )
+        '@
+        $script | uv run python -
+
+    - name: Run Windows target pytest suite
+      shell: pwsh
+      run: |
+        $targets = @(
+          "tests/unit/archs/platform/"
+          "tests/unit/test_cli_entrypoint_checks.py"
+          "tests/unit/test_cli_commands_chat.py"
+          "tests/unit/test_cli_agent_runner_stdio.py"
+          "tests/unit/test_cli_run_agent.py"
+          "tests/unit/test_cli_wrapper.py"
+          "tests/unit/test_platform_test_utils.py"
+          "tests/unit/test_skill.py"
+          "tests/unit/archs/sandbox/test_windows_local_sandbox_smoke.py"
+          "tests/unit/archs/sandbox/test_base_sandbox.py"
+          "tests/unit/archs/sandbox/test_e2b_sandbox_unit.py::TestResolvePath"
+          "tests/unit/archs/sandbox/test_e2b_sandbox_unit.py::TestDefaultWorkDir"
+          "tests/unit/archs/main_sub/test_cleanup_manager.py"
+          "tests/unit/test_builtin_tools/test_read_file.py"
+          "tests/unit/test_builtin_tools/test_read_visual_file.py"
+          "tests/unit/test_builtin_tools/test_run_shell_command.py"
+          "tests/unit/test_builtin_tools/test_search_file_content.py"
+          "tests/unit/test_builtin_tools/test_replace.py"
+          "tests/unit/test_config.py"
+          "tests/integration/test_mcp_transports.py::test_stdio_discover_call_repeat_and_cleanup"
+          "tests/integration/test_mcp_agent_lifecycle.py::test_sync_agent_runs_twice_across_event_loops_and_cleans_stdio"
+        )
+        uv run pytest $targets --timeout=120 -v --tb=short
+
+  windows-entrypoint-smoke:
+    name: windows-entrypoint-smoke
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - *setup-python
+    - name: Install uv (Windows)
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        irm https://astral.sh/uv/install.ps1 | iex
+        $uvDir = @(
+          "$env:USERPROFILE\.local\bin"
+          "$env:USERPROFILE\.cargo\bin"
+        ) | Where-Object { Test-Path (Join-Path $_ 'uv.exe') } | Select-Object -First 1
+        if (-not $uvDir) {
+          throw "uv.exe was not installed to an expected user bin directory."
+        }
+        $uvDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - *install-deps
+    - name: Verify default Windows shell backend
+      shell: pwsh
+      run: |
+        $script = @'
+        from nexau.archs.platform.shell_backend import ensure_default_windows_shell
+
+        inst = ensure_default_windows_shell()
+        print(
+            "default Windows shell backend: "
+            f"kind={inst.kind} path={inst.executable_path} "
+            f"source={inst.source} version={inst.version}"
+        )
+        '@
+        $script | uv run python -
+
+    - name: Run RFC-0020 T4 entrypoint and backend link tests
+      shell: pwsh
+      run: |
+        $targets = @(
+          "tests/unit/test_cli_entrypoint_checks.py"
+          "tests/unit/test_cli_commands_chat.py"
+          "tests/unit/test_cli_run_agent.py"
+          "tests/unit/test_cli_wrapper.py"
+          "tests/unit/archs/platform/test_shell_backend.py"
+        )
+        uv run pytest $targets --timeout=120 -v --tb=short
+
+    - name: Smoke test nexau chat runtime path
+      shell: pwsh
+      run: |
+        $PSNativeCommandUseErrorActionPreference = $false
+        Remove-Item Env:LLM_MODEL, Env:LLM_BASE_URL, Env:LLM_API_KEY -ErrorAction SilentlyContinue
+        $output = uv run nexau chat examples/simple_research/main_agent.yaml --query "windows-smoke" 2>&1
+        $code = $LASTEXITCODE
+        $text = ($output | Out-String)
+        Write-Host $text
+        if ($code -eq 0) {
+          throw "Expected `nexau chat` smoke to fail after entering the runtime path, but it exited 0."
+        }
+        if ($text -notmatch "Environment variable 'LLM_MODEL' is not set") {
+          throw "Expected `nexau chat` smoke to reach post-default-shell config loading and fail on missing LLM_MODEL."
+        }
+        exit 0
+
+    - name: Smoke test nexau main entrypoint help
+      shell: pwsh
+      run: uv run nexau --help
+
+    - name: Smoke test run_agent module help
+      shell: pwsh
+      run: uv run python -m nexau.cli.run_agent --help
+
+    - name: Smoke test run-agent.cmd help
+      shell: pwsh
+      run: .\run-agent.cmd --help
+
+    - name: Smoke test npm agent wrapper help
+      shell: pwsh
+      run: npm run agent -- --help
+
+    - name: Smoke test nexau-cli shim help
+      shell: pwsh
+      run: uv run nexau-cli --help
+
+  test-saas:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - *setup-python
+    - *install-uv
+    - *install-deps
+
+    - name: Verify E2B credentials
+      env:
+        E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+      run: |
+        if [ -z "$E2B_API_KEY" ]; then
+          echo "::error::E2B_API_KEY secret is not set. E2B tests would be silently skipped."
+          exit 1
+        fi
+
+    - name: Debug environment
+      run: |
+        echo "=== Python version ==="
+        python --version
+        echo "=== greenlet check ==="
+        uv run python -c "import greenlet; print(f'greenlet {greenlet.__version__} OK')" || echo "GREENLET NOT AVAILABLE"
+        echo "=== aiosqlite check ==="
+        uv run python -c "import aiosqlite; print('aiosqlite OK')" || echo "AIOSQLITE NOT AVAILABLE"
+        echo "=== uv pip list (relevant) ==="
+        uv run pip list 2>/dev/null | grep -iE "greenlet|sqlalchemy|aiosqlite|sqlmodel" || true
+
+    - name: Run tests with coverage (E2B SaaS)
+      timeout-minutes: 30
+      env:
+        LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        LLM_MODEL: ${{ vars.LLM_MODEL }}
+        LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+        E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+        LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+        LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+        LANGFUSE_HOST: ${{ vars.LANGFUSE_HOST }}
+        # RFC-0023 §阶段 ③ — surface the live aggregator-truth matrix
+        # against real provider endpoints so SaaS CI catches Set A
+        # build()/adapter shape mismatches the deleted Set B parity
+        # tests used to cover. Gateway-routed entries (chat_14_*,
+        # responses_14_*, anthropic_14_*, gemini_14_*) skip without
+        # their dedicated TOKEN_MATRIX_GATEWAY_* keys; provider-direct
+        # entries (gemini_real_25flash) run with the secrets below.
+        NEXAU_RUN_LIVE_LLM_TESTS: "1"
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        NORTHGATE_API_KEY: ${{ secrets.NORTHGATE_API_KEY }}
+        # 14.103 gateway routes Gemini to a paid tier — needed because
+        # the public ``GEMINI_API_KEY`` free tier caps at 20 daily
+        # requests for one model and 0 for everything else.
+        TOKEN_MATRIX_GATEWAY_GEMINI_API_KEY: ${{ secrets.TOKEN_MATRIX_GATEWAY_GEMINI_API_KEY }}
+        # Cross-provider replay matrix (RFC-0014) — 64 cases verifying
+        # that turn-1 history persisted from provider A re-serializes
+        # byte-stable when sent to provider B on turn 2. Main regression
+        # net for "PR-C.2 Set A aggregator → ModelResponse → UMP →
+        # ump_to_X serializer chain didn't break prompt cache prefix
+        # or thinking signature roundtrip". Plus 5 same-provider 2-turn
+        # payload tests. All four LIVE_* providers route through northgate
+        # except Gemini, which uses the dedicated 14.103 gateway key.
+        # ``gpt-5.5`` chosen for OpenAI Chat path because the deepseek-v4
+        # series (flash + pro) returns 400 ``unknown variant 'image_url'``
+        # on the Chat endpoint, blocking 7 image cross-provider cases.
+        # gpt-5.5 supports vision on Chat and matches LIVE_OPENAI_RESPONSES_MODEL
+        # for clean Chat↔Responses A/B comparison.
+        LIVE_OPENAI_CHAT_API_KEY: ${{ secrets.NORTHGATE_API_KEY }}
+        LIVE_OPENAI_CHAT_BASE_URL: https://northgate.xiaobei.top/v1
+        LIVE_OPENAI_CHAT_MODEL: gpt-5.5
+        LIVE_OPENAI_RESPONSES_API_KEY: ${{ secrets.NORTHGATE_API_KEY }}
+        LIVE_OPENAI_RESPONSES_BASE_URL: https://northgate.xiaobei.top/v1
+        LIVE_OPENAI_RESPONSES_MODEL: gpt-5.5
+        LIVE_ANTHROPIC_API_KEY: ${{ secrets.NORTHGATE_API_KEY }}
+        LIVE_ANTHROPIC_BASE_URL: https://northgate.xiaobei.top
+        LIVE_ANTHROPIC_MODEL: claude-sonnet-4-5-20250929
+        LIVE_GEMINI_API_KEY: ${{ secrets.TOKEN_MATRIX_GATEWAY_GEMINI_API_KEY }}
+        LIVE_GEMINI_BASE_URL: http://14.103.60.158:3001/v1beta
+        LIVE_GEMINI_MODEL: gemini-3.1-flash-lite-preview
+      run: |
+        make test
+
+    - name: Upload test coverage to Codecov
+      # Always upload, even when ``make test`` failed — otherwise an
+      # unrelated flake (e.g. ``test_interrupt_persistence`` cancellation
+      # timing) blocks the codecov/patch gate by leaving stale carryforward
+      # results, masking real coverage on the latest commit.
+      if: always()
+      uses: codecov/codecov-action@v5
+      with:
+        name: test-coverage-saas
+        files: ./coverage.xml
+        flags: unittests-saas
+        verbose: true
+        use_oidc: true
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    - name: Upload test coverage HTML
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-coverage-html-saas
+        path: htmlcov/
+
+  test-selfhost:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - *setup-python
+    - *install-uv
+    - *install-deps
+
+    - name: Verify E2B Self-Host credentials
+      env:
+        E2B_API_KEY: ${{ secrets.E2B_SELFHOST_API_KEY }}
+        E2B_API_URL: ${{ vars.E2B_SELFHOST_API_URL }}
+        E2B_DOMAIN: ${{ vars.E2B_SELFHOST_DOMAIN }}
+        E2B_TEMPLATE: ${{ vars.E2B_SELFHOST_TEMPLATE }}
+      run: |
+        if [ -z "$E2B_API_KEY" ]; then
+          echo "::error::E2B_SELFHOST_API_KEY secret is not set. Self-host E2B tests would be silently skipped."
+          exit 1
+        fi
+        if [ -z "$E2B_API_URL" ]; then
+          echo "::error::E2B_SELFHOST_API_URL variable is not set."
+          exit 1
+        fi
+        if [ -z "$E2B_DOMAIN" ]; then
+          echo "::error::E2B_SELFHOST_DOMAIN variable is not set."
+          exit 1
+        fi
+        if [ -z "$E2B_TEMPLATE" ]; then
+          echo "::error::E2B_SELFHOST_TEMPLATE variable is not set."
+          exit 1
+        fi
+
+    - name: Run tests with coverage (E2B Self-Host)
+      env:
+        LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        LLM_MODEL: ${{ vars.LLM_MODEL }}
+        LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+        E2B_API_KEY: ${{ secrets.E2B_SELFHOST_API_KEY }}
+        E2B_API_URL: ${{ vars.E2B_SELFHOST_API_URL }}
+        E2B_DOMAIN: ${{ vars.E2B_SELFHOST_DOMAIN }}
+        E2B_TEMPLATE: ${{ vars.E2B_SELFHOST_TEMPLATE }}
+      run: |
+        uv run pytest tests/unit/archs/sandbox/ \
+          --cov=nexau.archs.sandbox \
+          --cov-report=xml --cov-report=html --cov-report=term \
+          -x --timeout=120
+
+    - name: Upload test coverage to Codecov
+      # Mirror the test-saas job: upload coverage even on test failure
+      # so an unrelated flake doesn't masquerade as a coverage regression.
+      if: always()
+      uses: codecov/codecov-action@v5
+      with:
+        name: test-coverage-selfhost
+        files: ./coverage.xml
+        flags: unittests-selfhost
+        verbose: true
+        use_oidc: true
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    - name: Upload test coverage HTML
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-coverage-html-selfhost
+        path: htmlcov/
+
+  # ---------------------------------------------------------------------------
+  # Postgres-flavour alembic migration tests.
+  #
+  # The SQLite migration tests in test-saas / test-selfhost catch most of the
+  # logic, but PG enforces several invariants SQLite ignores:
+  #
+  # - CHECK constraints (e.g. permission_rules.behavior IN ('allow','deny'))
+  # - JSONB column type vs SQLite's TEXT-backed JSON
+  # - Partial unique index WHERE clauses (multi-NULL semantics for
+  #   idempotency_key)
+  # - alembic baseline detection runs different catalog queries on PG
+  #
+  # Dedicated lightweight job so a PG-specific regression fails fast without
+  # waiting on the 30-min E2B test-saas job.
+  # ---------------------------------------------------------------------------
+  test-migrations-pg:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: nexau
+          POSTGRES_PASSWORD: nexau
+          POSTGRES_DB: nexau_migrations_test
+        ports:
+          - 5432:5432
+        # tcp_keepalives_idle bumps so the test doesn't see idle disconnects
+        # during the brief gap between connections; pg_isready loop in the
+        # health-check is the load-bearing readiness signal.
+        options: >-
+          --health-cmd "pg_isready -U nexau -d nexau_migrations_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - *setup-python
+    - *install-uv
+    - *install-deps
+
+    # Both PG drivers are opt-in (only Postgres tests need them):
+    # - psycopg2 is the sync driver alembic uses for upgrade_to_head + the
+    #   verification SELECTs in the test helpers.
+    # - asyncpg is the async driver SQLDatabaseEngine.from_url() picks for
+    #   ``postgresql+asyncpg://...`` URLs (test_postgres_fresh_db_*
+    #   constructs the async URL by swapping the dialect).
+    - name: Install Postgres drivers
+      run: uv pip install psycopg2-binary asyncpg
+
+    - name: Run alembic migration suite against Postgres
+      env:
+        NEXAU_PG_TEST_URL: postgresql+psycopg2://nexau:nexau@localhost:5432/nexau_migrations_test
+      run: |
+        # Run the same test_db_migrations.py file we run under SQLite —
+        # the PG-gated tests (including downgrade rollback paths) are
+        # skipif-guarded on NEXAU_PG_TEST_URL, so setting it here flips
+        # them on. SQLite tests run too as a belt-and-braces sanity check
+        # (cheap; ~0.5s). Coverage is on so PG-only branches in
+        # nexau/db/migrate.py + nexau/db/migrations/versions/* count.
+        uv run pytest tests/unit/test_db_migrations.py -v --timeout=60 \
+          --cov=nexau.db --cov-report=xml --cov-report=term
+
+    - name: Upload migration coverage to Codecov
+      if: always()
+      uses: codecov/codecov-action@v5
+      with:
+        name: test-coverage-migrations-pg
+        files: ./coverage.xml
+        flags: unittests-migrations-pg
+        fail_ci_if_error: false
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

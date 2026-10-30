@@ -1,0 +1,17 @@
+{
+  "name": "nexau",
+  "version": "0.1.1",
+  "description": "NexAU - Agent Framework",
+  "scripts": {
+    "setup-cli": "cd cli && npm install && npm run build && cd ..",
+    "run-agent": "uv run python -m nexau.cli.run_agent",
+    "agent": "uv run python -m nexau.cli.run_agent"
+  },
+  "bin": {
+    "nexau-cli": "./cli/dist/cli.js"
+  },
+  "dependencies": {
+    "ink": "^6.4.0",
+    "react": "^19.2.0"
+  }
+}

@@ -1,0 +1,148 @@
+name: "Project: Auto Backlog ↔ Todo + close open Done issues"
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  auto-status:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync project status and issue state
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+          REPO_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          PROJECT_ID="PVT_kwDOCmnEdM4BQARn"
+          STATUS_FIELD_ID="PVTSSF_lADOCmnEdM4BQARnzg-P8lI"
+          BACKLOG_OPTION_ID="676b1ff9"
+          TODO_OPTION_ID="0bfee3fe"
+          DONE_OPTION_ID="1113ce28"
+          REPO_NAME="${{ github.repository }}"
+
+          echo "Fetching project items for $REPO_NAME ..."
+
+          HAS_NEXT=true
+          CURSOR=""
+          MOVED=0
+          CLOSED=0
+
+          while [ "$HAS_NEXT" = "true" ]; do
+            if [ -z "$CURSOR" ]; then
+              AFTER_ARG=""
+            else
+              AFTER_ARG=", after: \"$CURSOR\""
+            fi
+
+            RESPONSE=$(gh api graphql -f query="
+            {
+              node(id: \"$PROJECT_ID\") {
+                ... on ProjectV2 {
+                  items(first: 100${AFTER_ARG}) {
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
+                    nodes {
+                      id
+                      statusVal: fieldValueByName(name: \"Status\") {
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          optionId
+                          name
+                        }
+                      }
+                      iterVal: fieldValueByName(name: \"Iteration\") {
+                        ... on ProjectV2ItemFieldIterationValue {
+                          iterationId
+                          title
+                        }
+                      }
+                      content {
+                        ... on Issue {
+                          title
+                          number
+                          state
+                          repository { nameWithOwner }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }")
+
+            HAS_NEXT=$(echo "$RESPONSE" | jq -r '.data.node.items.pageInfo.hasNextPage')
+            CURSOR=$(echo "$RESPONSE" | jq -r '.data.node.items.pageInfo.endCursor')
+
+            ITEMS=$(echo "$RESPONSE" | jq -c '.data.node.items.nodes[]')
+
+            while IFS= read -r ITEM; do
+              [ -z "$ITEM" ] && continue
+
+              ITEM_ID=$(echo "$ITEM" | jq -r '.id')
+              STATUS_OPT=$(echo "$ITEM" | jq -r '.statusVal.optionId // ""')
+              ITER_ID=$(echo "$ITEM" | jq -r '.iterVal.iterationId // ""')
+              ITER_TITLE=$(echo "$ITEM" | jq -r '.iterVal.title // ""')
+              TITLE=$(echo "$ITEM" | jq -r '.content.title // "Draft"')
+              NUM=$(echo "$ITEM" | jq -r '.content.number // ""')
+              CONTENT_STATE=$(echo "$ITEM" | jq -r '.content.state // ""')
+              CONTENT_REPO=$(echo "$ITEM" | jq -r '.content.repository.nameWithOwner // ""')
+
+              # Backlog + has Iteration → Todo
+              if [ "$STATUS_OPT" = "$BACKLOG_OPTION_ID" ] && [ -n "$ITER_ID" ]; then
+                echo "Moving: #$NUM $TITLE (iteration: $ITER_TITLE) → Todo"
+                gh api graphql -f query="
+                mutation {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: \"$PROJECT_ID\"
+                    itemId: \"$ITEM_ID\"
+                    fieldId: \"$STATUS_FIELD_ID\"
+                    value: { singleSelectOptionId: \"$TODO_OPTION_ID\" }
+                  }) {
+                    projectV2Item { id }
+                  }
+                }" > /dev/null
+                MOVED=$((MOVED + 1))
+              fi
+
+              # Todo + no Iteration → Backlog
+              if [ "$STATUS_OPT" = "$TODO_OPTION_ID" ] && [ -z "$ITER_ID" ]; then
+                echo "Moving back: #$NUM $TITLE → Backlog (Iteration cleared)"
+                gh api graphql -f query="
+                mutation {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: \"$PROJECT_ID\"
+                    itemId: \"$ITEM_ID\"
+                    fieldId: \"$STATUS_FIELD_ID\"
+                    value: { singleSelectOptionId: \"$BACKLOG_OPTION_ID\" }
+                  }) {
+                    projectV2Item { id }
+                  }
+                }" > /dev/null
+                MOVED=$((MOVED + 1))
+              fi
+
+              # Status=Done but issue still OPEN in this repo → close as completed
+              if [ "$STATUS_OPT" = "$DONE_OPTION_ID" ] \
+                && [ "$CONTENT_STATE" = "OPEN" ] \
+                && [ "$CONTENT_REPO" = "$REPO_NAME" ] \
+                && [ -n "$NUM" ]; then
+                echo "Closing issue: #$NUM $TITLE (Status=Done but issue still open)"
+                GH_TOKEN="$REPO_GITHUB_TOKEN" gh api \
+                  "repos/$REPO_NAME/issues/$NUM" \
+                  -X PATCH \
+                  -f state=closed \
+                  -f state_reason=completed > /dev/null
+                CLOSED=$((CLOSED + 1))
+              fi
+            done <<< "$ITEMS"
+          done
+
+          echo "Done. Moved $MOVED item(s); closed $CLOSED open issue(s) whose Status was Done."

@@ -1,0 +1,884 @@
+# Copyright (c) Nex-AGI. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Hook interfaces, middleware abstractions, and utilities for agent execution."""
+
+from __future__ import annotations
+
+import inspect
+import logging
+import threading
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
+
+from nexau.core.messages import Message
+
+from .model_response import ModelResponse
+from .parse_structures import ParsedResponse
+
+if TYPE_CHECKING:
+    from nexau.archs.sandbox.base_sandbox import BaseSandbox
+    from nexau.archs.tool.tool import StructuredToolDefinitionLike
+
+    from ..agent_state import AgentState
+    from ..framework_context import FrameworkContext
+    from ..token_trace_session import TokenTraceSession
+    from .executor import AgentStopReason
+    from .history_events import HistoryEvent
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BeforeAgentHookInput:
+    """Input passed to before_agent hooks prior to the run loop."""
+
+    agent_state: AgentState
+    messages: list[Message]
+    # RFC-0024 / RFC-0006: typed framework context. Read by hooks that need
+    # caller-supplied trace_id (e.g. ``AgentEventsMiddleware`` for
+    # ``RunStartedEvent.trace_id``) without reaching into ``AgentState``,
+    # which is on the deprecation path. Optional for back-compat with
+    # tests that build the hook input directly without an executor.
+    framework_context: FrameworkContext | None = None
+
+
+@dataclass
+class AfterAgentHookInput:
+    """Input passed to after_agent hooks once execution finishes."""
+
+    agent_state: AgentState
+    messages: list[Message]
+    agent_response: str
+    stop_reason: AgentStopReason | None = None
+
+
+@dataclass
+class BeforeModelHookInput:
+    """Input data passed to before_model_hooks.
+
+    This class encapsulates all the information that hooks receive:
+    - agent_state: The AgentState containing agent context and global storage
+    - messages: The current conversation history
+    - max_iterations: The maximum number of iterations
+    - current_iteration: The current iteration
+    """
+
+    agent_state: AgentState
+    max_iterations: int
+    current_iteration: int
+    messages: list[Message]
+    # RFC-0026: outparam — MiddlewareManager publishes the typed history
+    # event set by any middleware here so executor can apply it after the
+    # iteration. None when no middleware emitted a typed event.
+    #
+    # Generic ``HistoryEvent`` slot (discriminated union over event type)
+    # rather than a per-event-type field so adding new event types
+    # (``UndoEvent`` / ``AppendEvent`` / future) doesn't churn this schema.
+    history_event: HistoryEvent | None = None
+    # RFC-0027: outparam — 与 history_event 同机制。当某个 before_model /
+    # after_model 中间件要求强制停止本次 run（如敏感词命中）时，
+    # MiddlewareManager 把 HookResult.force_stop_reason 回写到这里，
+    # 由 executor 在 hook 边界读取并 BREAK。None 表示无中间件要求停止。
+    force_stop_reason: AgentStopReason | None = None
+
+
+@dataclass
+class AfterModelHookInput(BeforeModelHookInput):
+    """Input data passed to after_model_hooks.
+
+    This class encapsulates all the information that hooks receive:
+    - original_response: The raw response from the LLM
+    - parsed_response: The parsed structure containing tool/agent calls
+    """
+
+    # Default "" so subclass field ordering remains valid after RFC-0026
+    # added a default-bearing field (history_event) to BeforeModelHookInput.
+    # All real call sites pass original_response as a kwarg, never positional.
+    original_response: str = ""
+    parsed_response: ParsedResponse | None = None
+    model_response: ModelResponse | None = None
+
+
+HookResultT = TypeVar("HookResultT", bound="HookResult")
+
+
+@dataclass
+class HookResult:
+    """Unified result object for all middleware hook phases."""
+
+    messages: list[Message] | None = None
+    parsed_response: ParsedResponse | None = None
+    force_continue: bool = False
+    tool_output: Any | None = None
+    llm_tool_output: Any | None = None
+    tool_input: dict[str, Any] | None = None
+    agent_response: str | None = None
+    # RFC-0026: opt-in typed history-event channel.
+    #
+    # When a middleware mutates state in a way that represents a *real
+    # history event* (compaction / ``/clear`` / future ``/compact`` /
+    # ``/undo``), it should set ``history_event`` to the typed event so
+    # the persisted action stream carries that event with full WHY
+    # metadata, not an opaque untyped REPLACE inferred from a fingerprint
+    # diff at flush time.
+    #
+    # Generic ``HistoryEvent`` discriminated union slot (today's variants:
+    # ``ReplaceEvent`` / ``AppendEvent`` / ``UndoEvent``; old SDK reading
+    # a future variant decodes to ``UnknownEvent`` → executor skips).
+    # Adding new event types means appending one variant to the union,
+    # not adding a new top-level field — schema stays stable.
+    #
+    # Backward-compatible: existing middleware that just returns
+    # ``messages`` (transient prompt mutation OR untyped replace) keeps
+    # working — the executor falls back to the existing fingerprint-diff
+    # path when this is None.
+    history_event: HistoryEvent | None = None
+
+    # RFC-0027: 中间件强制停止信号。before_model / after_model 中间件设置此值时，
+    # MiddlewareManager 会把它 surface 到 hook_input.force_stop_reason（outparam），
+    # executor 据此在 hook 边界终止本次 run，并将该 reason 作为最终停止原因。
+    force_stop_reason: AgentStopReason | None = None
+
+    def has_messages(self) -> bool:
+        return self.messages is not None
+
+    def has_parsed_response(self) -> bool:
+        return self.parsed_response is not None
+
+    def has_tool_output(self) -> bool:
+        return self.tool_output is not None
+
+    def has_llm_tool_output(self) -> bool:
+        return self.llm_tool_output is not None
+
+    def has_agent_response(self) -> bool:
+        return self.agent_response is not None
+
+    def has_modifications(self) -> bool:
+        return (
+            self.has_messages()
+            or self.has_parsed_response()
+            or self.force_continue
+            or self.has_tool_output()
+            or self.has_llm_tool_output()
+            or self.tool_input is not None
+            or self.has_agent_response()
+        )
+
+    @classmethod
+    def no_changes(cls: type[HookResultT]) -> HookResultT:
+        return cls()
+
+    @classmethod
+    def with_modifications(
+        cls: type[HookResultT],
+        *,
+        messages: list[Message] | None = None,
+        parsed_response: ParsedResponse | None = None,
+        force_continue: bool = False,
+        tool_output: Any | None = None,
+        llm_tool_output: Any | None = None,
+        tool_input: dict[str, Any] | None = None,
+        agent_response: str | None = None,
+        history_event: HistoryEvent | None = None,
+    ) -> HookResultT:
+        return cls(
+            messages=messages,
+            parsed_response=parsed_response,
+            force_continue=force_continue,
+            tool_output=tool_output,
+            llm_tool_output=llm_tool_output,
+            tool_input=tool_input,
+            agent_response=agent_response,
+            history_event=history_event,
+        )
+
+
+class BeforeModelHookResult(HookResult):
+    """Backward compatible alias for HookResult (before model)."""
+
+    @classmethod
+    def with_modifications(cls, messages: list[Message] | None = None) -> BeforeModelHookResult:  # type: ignore[override]
+        return cls(messages=messages)
+
+
+class AfterModelHookResult(HookResult):
+    """Backward compatible alias for HookResult (after model)."""
+
+    @classmethod
+    def with_modifications(  # type: ignore[override]
+        cls,
+        parsed_response: ParsedResponse | None = None,
+        messages: list[Message] | None = None,
+        force_continue: bool = False,
+    ) -> AfterModelHookResult:
+        return cls(
+            parsed_response=parsed_response,
+            messages=messages,
+            force_continue=force_continue,
+        )
+
+
+@dataclass
+class BeforeToolHookInput:
+    """Input data passed to before_tool hooks."""
+
+    agent_state: AgentState
+    sandbox: BaseSandbox | None
+    tool_name: str
+    tool_call_id: str
+    tool_input: dict[str, Any]
+    parallel_execution_id: str | None = None
+
+
+@dataclass
+class AfterToolHookInput(BeforeToolHookInput):
+    """Input data passed to after_tool_hooks."""
+
+    tool_output: Any = None
+    llm_tool_output: Any = None
+
+
+@dataclass
+class AfterToolHookResult(HookResult):
+    """Backward compatible alias for HookResult (after tool)."""
+
+    @classmethod
+    def with_modifications(  # type: ignore[override]
+        cls,
+        *,
+        tool_output: Any | None = None,
+        llm_tool_output: Any | None = None,
+    ) -> AfterToolHookResult:
+        return cls(tool_output=tool_output, llm_tool_output=llm_tool_output)
+
+
+class BeforeModelHook(Protocol):
+    def __call__(self, hook_input: BeforeModelHookInput) -> HookResult: ...
+
+
+class AfterModelHook(Protocol):
+    def __call__(self, hook_input: AfterModelHookInput) -> HookResult: ...
+
+
+class AfterToolHook(Protocol):
+    def __call__(self, hook_input: AfterToolHookInput) -> HookResult: ...
+
+
+class BeforeToolHook(Protocol):
+    def __call__(self, hook_input: BeforeToolHookInput) -> HookResult: ...
+
+
+@dataclass
+class ModelCallParams:
+    """Context passed to middleware wrapping model calls."""
+
+    messages: list[Message]
+    max_tokens: int | None
+    force_stop_reason: AgentStopReason | None
+    agent_state: AgentState | None
+    tool_call_mode: str
+    tools: Sequence[StructuredToolDefinitionLike] | None
+    api_params: dict[str, Any]
+    openai_client: Any | None = None
+    llm_config: Any | None = None
+    retry_attempts: int = 5
+    shutdown_event: threading.Event | None = None
+    token_trace_session: TokenTraceSession | None = None
+    # RFC-0026: typed-event API surface for wrap_model_call middleware
+    # (e.g. emergency compaction). Replaces the deprecated
+    # ``agent_state.history`` direct backref. Read via
+    # ``params.framework_context.history.replace(messages, extra=variant)``.
+    framework_context: FrameworkContext | None = None
+
+
+@dataclass
+class ToolCallParams:
+    """Context passed to middleware wrapping tool calls."""
+
+    agent_state: AgentState
+    sandbox: BaseSandbox | None
+    tool_name: str
+    parameters: dict[str, Any]
+    tool_call_id: str
+    execution_params: dict[str, Any]
+
+
+ModelCallFn = Callable[[ModelCallParams], ModelResponse | None]
+ToolCallFn = Callable[[ToolCallParams], Any]
+
+
+class Middleware:
+    """Extensible middleware abstraction for agent execution pipeline."""
+
+    source_id: str | None = None
+
+    def before_agent(self, hook_input: BeforeAgentHookInput) -> HookResult:
+        return HookResult.no_changes()
+
+    def after_agent(self, hook_input: AfterAgentHookInput) -> HookResult:
+        return HookResult.no_changes()
+
+    def before_model(self, hook_input: BeforeModelHookInput) -> HookResult:
+        return HookResult.no_changes()
+
+    def after_model(self, hook_input: AfterModelHookInput) -> HookResult:
+        return HookResult.no_changes()
+
+    def after_tool(self, hook_input: AfterToolHookInput) -> HookResult:
+        return HookResult.no_changes()
+
+    def before_tool(self, hook_input: BeforeToolHookInput) -> HookResult:
+        return HookResult.no_changes()
+
+    def wrap_model_call(self, params: ModelCallParams, call_next: ModelCallFn) -> ModelResponse | None:
+        """Default implementation simply forwards to the next handler."""
+
+        return call_next(params)
+
+    def wrap_tool_call(self, params: ToolCallParams, call_next: ToolCallFn) -> Any:
+        """Default implementation simply forwards to the next handler."""
+
+        return call_next(params)
+
+    def stream_chunk(self, chunk: Any, params: ModelCallParams) -> Any:
+        """Inspect or mutate a streaming model chunk before aggregation."""
+
+        return chunk
+
+    # ------------------------------------------------------------------
+    # Optional lifecycle hooks (override in subclasses that need them)
+    # ------------------------------------------------------------------
+
+    # NOTE: on_event is intentionally NOT defined here as a method.
+    # AgentEventsMiddleware stores on_event as a callable instance attribute
+    # (self.on_event = on_event), which would conflict with a base method
+    # definition (mypy: "Cannot assign to a method").
+    # The executor uses supports_on_event to detect the attribute at runtime.
+
+    def set_event_emitter(self, emitter: Callable[[Any], None]) -> None:
+        """Receive the unified event emitter callback. Override to accept it."""
+
+    def set_llm_runtime(
+        self,
+        llm_config: Any,
+        openai_client: Any,
+        *,
+        session_id: str | None = None,
+        global_storage: Any | None = None,
+        max_context_tokens: int | None = None,
+    ) -> None:
+        """Receive base LLM runtime settings. Override to accept them."""
+
+    @property
+    def supports_on_event(self) -> bool:
+        """True if this middleware provides an on_event callback.
+
+        Detects both:
+        - Instance attribute pattern: self.on_event = some_callable (AgentEventsMiddleware)
+        - Method override pattern: subclass defines def on_event(...)
+        """
+        on_event_attr = getattr(self, "on_event", None)  # noqa: B009 — intentional duck-typing for on_event
+        return callable(on_event_attr)
+
+    def get_event_handler(self) -> Callable[[Any], None] | None:
+        """Return the on_event callback if this middleware provides one, else None.
+
+        Typed accessor for the executor — avoids direct attribute access on a
+        field that only some subclasses define.
+        """
+        on_event_attr = getattr(self, "on_event", None)  # noqa: B009
+        if callable(on_event_attr):
+            return cast(Callable[[Any], None], on_event_attr)
+        return None
+
+    @property
+    def supports_set_event_emitter(self) -> bool:
+        """True if the subclass overrides set_event_emitter."""
+        return type(self).set_event_emitter is not Middleware.set_event_emitter
+
+    @property
+    def supports_set_llm_runtime(self) -> bool:
+        """True if the subclass overrides set_llm_runtime."""
+        return type(self).set_llm_runtime is not Middleware.set_llm_runtime
+
+
+class FunctionMiddleware(Middleware):
+    """Wraps legacy hook callables into middleware instances."""
+
+    def __init__(
+        self,
+        *,
+        before_model_hook: BeforeModelHook | None = None,
+        after_model_hook: AfterModelHook | None = None,
+        after_tool_hook: AfterToolHook | None = None,
+        before_tool_hook: BeforeToolHook | None = None,
+        name: str | None = None,
+    ) -> None:
+        self.before_model_hook = before_model_hook
+        self.after_model_hook = after_model_hook
+        self.after_tool_hook = after_tool_hook
+        self.before_tool_hook = before_tool_hook
+        self.name = name or "function_middleware"
+
+    def before_model(self, hook_input: BeforeModelHookInput) -> HookResult:
+        if not self.before_model_hook:
+            return HookResult.no_changes()
+        return self.before_model_hook(hook_input)
+
+    def after_model(self, hook_input: AfterModelHookInput) -> HookResult:
+        if not self.after_model_hook:
+            return HookResult.no_changes()
+        return self.after_model_hook(hook_input)
+
+    def after_tool(self, hook_input: AfterToolHookInput) -> HookResult:
+        if not self.after_tool_hook:
+            return HookResult.no_changes()
+        return self.after_tool_hook(hook_input)
+
+    def before_tool(self, hook_input: BeforeToolHookInput) -> HookResult:
+        if not self.before_tool_hook:
+            return HookResult.no_changes()
+        return self.before_tool_hook(hook_input)
+
+    def __repr__(self) -> str:  # pragma: no cover - helper for debugging
+        hooks: list[str] = []
+        if self.before_model_hook:
+            hooks.append("before_model")
+        if self.after_model_hook:
+            hooks.append("after_model")
+        if self.after_tool_hook:
+            hooks.append("after_tool")
+        if self.before_tool_hook:
+            hooks.append("before_tool")
+        return f"FunctionMiddleware(name={self.name}, hooks={hooks})"
+
+
+class LoggingMiddleware(Middleware):
+    """Middleware that logs after-model and/or after-tool phases."""
+
+    def __init__(
+        self,
+        *,
+        model_logger: str | None = None,
+        tool_logger: str | None = None,
+        message_preview_chars: int = 120,
+        tool_preview_chars: int = 500,
+        log_model_calls: bool = False,
+    ) -> None:
+        self.model_logger = logging.getLogger(model_logger) if model_logger else None
+        self.tool_logger = logging.getLogger(tool_logger) if tool_logger else None
+        self.message_preview_chars = message_preview_chars
+        self.tool_preview_chars = tool_preview_chars
+        self.log_model_calls = log_model_calls
+
+    def before_model(self, hook_input: BeforeModelHookInput) -> HookResult:  # type: ignore[override]
+        logger = self.model_logger
+        if not logger:
+            return HookResult.no_changes()
+
+        logger.info(
+            f"before_model hook triggered agent_id: {hook_input.agent_state.agent_id}, agent_name: {hook_input.agent_state.agent_name}"
+        )
+        return HookResult.no_changes()
+
+    def after_model(self, hook_input: AfterModelHookInput) -> HookResult:  # type: ignore[override]
+        logger = self.model_logger
+        if not logger:
+            return HookResult.no_changes()
+
+        parsed = hook_input.parsed_response
+        logger.info("🎣 ===== AFTER MODEL HOOK TRIGGERED =====")
+        logger.info("Agent: %s (%s)", hook_input.agent_state.agent_name, hook_input.agent_state.agent_id)
+        logger.info("Response length: %s characters", len(hook_input.original_response))
+
+        if parsed is None:
+            logger.info("No parsed response available")
+        else:
+            logger.info("Summary: %s", parsed.get_call_summary())
+            logger.info("Tool calls: %s", len(parsed.tool_calls))
+            logger.info("Parallel tools: %s", parsed.is_parallel_tools)
+
+        logger.info("Message history: %s items", len(hook_input.messages))
+        for idx, msg in enumerate(hook_input.messages[-3:]):
+            preview = msg.get_text_content()[: self.message_preview_chars]
+            logger.info("Recent message %s: %s -> %s", idx + 1, msg.role.value, preview)
+            logger.info(
+                f"after_model hook triggered agent_id: {hook_input.agent_state.agent_id}, agent_name: {hook_input.agent_state.agent_name}"
+            )
+
+        logger.info("🎣 ===== END AFTER MODEL HOOK =====")
+        return HookResult.no_changes()
+
+    def before_tool(self, hook_input: BeforeToolHookInput) -> HookResult:  # type: ignore[override]
+        logger = self.tool_logger
+        if not logger:
+            return HookResult.no_changes()
+        logger.info(
+            f"before_tool hook triggered "
+            f"tool_id: {hook_input.tool_call_id}, "
+            f"tool_name: {hook_input.tool_name}, "
+            f"agent_name: {hook_input.agent_state.agent_name}, "
+            f"agent_id: {hook_input.agent_state.agent_id}"
+        )
+        return HookResult.no_changes()
+
+    def after_tool(self, hook_input: AfterToolHookInput) -> HookResult:  # type: ignore[override]
+        logger = self.tool_logger
+        if not logger:
+            return HookResult.no_changes()
+
+        logger.info("🔧 ===== AFTER TOOL HOOK TRIGGERED =====")
+        logger.info("Agent: %s (%s)", hook_input.agent_state.agent_name, hook_input.agent_state.agent_id)
+        logger.info("Tool: %s", hook_input.tool_name)
+        logger.info("Input: %s", hook_input.tool_input)
+
+        output_preview = str(hook_input.tool_output)
+        if len(output_preview) > self.tool_preview_chars:
+            truncated = output_preview[: self.tool_preview_chars]
+            logger.info("🔧 Tool output (truncated): %s...", truncated)
+        else:
+            logger.info("🔧 Tool output: %s", output_preview)
+
+        if hook_input.llm_tool_output is not None:
+            llm_output_preview = str(hook_input.llm_tool_output)
+            if len(llm_output_preview) > self.tool_preview_chars:
+                llm_truncated = llm_output_preview[: self.tool_preview_chars]
+                logger.info("🔧 LLM tool output (truncated): %s...", llm_truncated)
+            else:
+                logger.info("🔧 LLM tool output: %s", llm_output_preview)
+
+        logger.info(
+            f"after_tool hook triggered "
+            f"tool_id: {hook_input.tool_call_id}, "
+            f"tool_name: {hook_input.tool_name}, "
+            f"agent_name: {hook_input.agent_state.agent_name}, "
+            f"agent_id: {hook_input.agent_state.agent_id}"
+        )
+        logger.info("🔧 ===== END AFTER TOOL HOOK =====")
+        return HookResult.no_changes()
+
+    def wrap_model_call(self, params: ModelCallParams, call_next: ModelCallFn) -> ModelResponse | None:  # type: ignore[override]
+        if not self.log_model_calls and not self.model_logger:
+            return call_next(params)
+
+        self._log_model_call(f"LLM call invoked with {len(params.messages)} messages")
+        try:
+            response = call_next(params)
+            if response is None:
+                self._log_model_call("LLM call returned no response")
+            else:
+                preview = (response.render_text() or response.content or "").strip()
+                if preview:
+                    preview = preview[: self.message_preview_chars]
+                    self._log_model_call(f"LLM response preview: {preview}")
+            return response
+        except Exception as exc:  # pragma: no cover - logging path
+            self._log_model_call(f"LLM call wrapper error: {exc}", error=True)
+            raise
+
+    def stream_chunk(self, chunk: Any, params: ModelCallParams) -> Any:
+        """Inspect or mutate a streaming model chunk before aggregation."""
+        logger = self.model_logger
+        if logger:
+            logger.info("🎣 Streaming: %s", chunk)
+
+        return chunk
+
+    def _log_model_call(self, message: str, error: bool = False) -> None:
+        logger = self.model_logger
+        if logger:
+            log_fn = logger.error if error else logger.info
+            log_fn(message)
+        else:
+            print(message)
+
+
+def create_tool_after_approve_hook(tool_name: str) -> AfterModelHook:
+    """Compatibility helper used by legacy examples to log approved tool usage."""
+
+    def _hook(hook_input: AfterModelHookInput) -> HookResult:
+        parsed = hook_input.parsed_response
+        if not parsed or not getattr(parsed, "tool_calls", None):
+            return HookResult.no_changes()
+
+        should_log = any(getattr(call, "tool_name", None) == tool_name for call in parsed.tool_calls)
+        if should_log:
+            logger.info("✅ Tool '%s' auto-approved by create_tool_after_approve_hook", tool_name)
+        return HookResult.no_changes()
+
+    return _hook
+
+
+class MiddlewareManager:
+    """Coordinates middleware execution across the agent lifecycle."""
+
+    def __init__(self, middlewares: list[Middleware] | None = None) -> None:
+        self.middlewares: list[Middleware] = middlewares or []
+
+    def add(self, middleware: Middleware) -> None:
+        self.middlewares.append(middleware)
+
+    def extend(self, middlewares: list[Middleware]) -> None:
+        self.middlewares.extend(middlewares)
+
+    def __bool__(self) -> bool:
+        return bool(self.middlewares)
+
+    def __len__(self) -> int:
+        return len(self.middlewares)
+
+    def run_before_agent(self, hook_input: BeforeAgentHookInput) -> list[Message]:
+        for middleware in self.middlewares:
+            handler = middleware.before_agent
+            try:
+                result = handler(hook_input)
+                hook_result = self._normalize_result(result)
+                if hook_result.messages is not None:
+                    hook_input.messages = hook_result.messages
+                    logger.info(
+                        "🎣 Middleware %s (before_agent) modified messages",
+                        middleware.__class__.__name__,
+                    )
+                else:
+                    logger.info(
+                        "🎣 Middleware %s (before_agent) made no changes",
+                        middleware.__class__.__name__,
+                    )
+            except Exception as exc:
+                logger.warning(f"⚠️ Before-agent middleware {middleware} failed: {exc}")
+        return hook_input.messages
+
+    def run_after_agent(
+        self,
+        hook_input: AfterAgentHookInput,
+    ) -> tuple[str, list[Message]]:
+        for middleware in reversed(self.middlewares):
+            handler = middleware.after_agent
+            try:
+                result = handler(hook_input)
+                hook_result = self._normalize_result(result)
+                if hook_result.agent_response is not None:
+                    hook_input.agent_response = hook_result.agent_response
+                    logger.info(
+                        "🎣 Middleware %s (after_agent) modified agent response",
+                        middleware.__class__.__name__,
+                    )
+                if hook_result.messages is not None:
+                    hook_input.messages = hook_result.messages
+                    logger.info(
+                        "🎣 Middleware %s (after_agent) modified messages",
+                        middleware.__class__.__name__,
+                    )
+            except Exception as exc:
+                logger.warning(f"⚠️ After-agent middleware {middleware} failed: {exc}")
+        return hook_input.agent_response, hook_input.messages
+
+    def run_before_model(self, hook_input: BeforeModelHookInput) -> list[Message]:
+        # RFC-0026: clear the typed-event outparam at the start of each run so
+        # stale state from a prior iteration can't leak through.
+        hook_input.history_event = None
+        # RFC-0027: same clear-outparam pattern for force-stop.
+        hook_input.force_stop_reason = None
+        current_messages = hook_input.messages
+        for _, middleware in enumerate(self.middlewares):
+            handler = getattr(middleware, "before_model", None)
+            if handler is None:
+                continue
+            try:
+                hook_input.messages = current_messages
+                result = handler(hook_input)
+                hook_result = self._normalize_result(result)
+                if hook_result.messages is not None:
+                    current_messages = hook_result.messages
+                    logger.info(f"🎣 Middleware {middleware.__class__.__name__} (before_model) modified messages")
+                else:
+                    logger.info(f"🎣 Middleware {middleware.__class__.__name__} (before_model) made no changes")
+                # RFC-0026: last writer wins on typed history-event intent. In practice
+                # only one middleware in a chain (compaction) sets this today.
+                if hook_result.history_event is not None:
+                    hook_input.history_event = hook_result.history_event
+                # RFC-0027: surface force-stop intent to the executor (last writer wins).
+                if hook_result.force_stop_reason is not None:
+                    hook_input.force_stop_reason = hook_result.force_stop_reason
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning(f"⚠️ Before-model middleware {middleware} failed: {exc}")
+        return current_messages
+
+    def run_after_model(
+        self,
+        hook_input: AfterModelHookInput,
+    ) -> tuple[ParsedResponse | None, list[Message], bool]:
+        # RFC-0026: same clear-outparam pattern as run_before_model.
+        hook_input.history_event = None
+        # RFC-0027: same clear-outparam pattern for force-stop.
+        hook_input.force_stop_reason = None
+        current_parsed = hook_input.parsed_response
+        current_messages = hook_input.messages
+        force_continue = False
+        for middleware in reversed(self.middlewares):
+            handler = getattr(middleware, "after_model", None)
+            if handler is None:
+                continue
+            try:
+                hook_input.parsed_response = current_parsed
+                hook_input.messages = current_messages
+                result = handler(hook_input)
+                hook_result = self._normalize_result(result)
+                if hook_result.parsed_response is not None:
+                    current_parsed = hook_result.parsed_response
+                    logger.info(f"🎣 Middleware {middleware.__class__.__name__} (after_model) modified parsed response")
+                if hook_result.messages is not None:
+                    current_messages = hook_result.messages
+                    logger.info(f"🎣 Middleware {middleware.__class__.__name__} (after_model) modified messages")
+                if hook_result.force_continue:
+                    force_continue = True
+                if hook_result.history_event is not None:
+                    hook_input.history_event = hook_result.history_event
+                # RFC-0027: surface force-stop intent to the executor (last writer wins).
+                if hook_result.force_stop_reason is not None:
+                    hook_input.force_stop_reason = hook_result.force_stop_reason
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning(f"⚠️ After-model middleware {middleware} failed: {exc}")
+        return current_parsed, current_messages, force_continue
+
+    def run_after_tool(
+        self,
+        hook_input: AfterToolHookInput,
+        initial_output: Any,
+        initial_llm_output: Any | None = None,
+    ) -> tuple[Any, Any | None]:
+        current_output = initial_output
+        current_llm_output = initial_llm_output
+        for middleware in reversed(self.middlewares):
+            handler = getattr(middleware, "after_tool", None)
+            if handler is None:
+                continue
+            try:
+                hook_input.tool_output = current_output
+                hook_input.llm_tool_output = current_llm_output
+                result = handler(hook_input)
+                hook_result = self._normalize_result(result)
+                if hook_result.tool_output is not None:
+                    current_output = hook_result.tool_output
+                if hook_result.llm_tool_output is not None:
+                    current_llm_output = hook_result.llm_tool_output
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning(f"⚠️ After-tool middleware {middleware} failed: {exc}")
+        return current_output, current_llm_output
+
+    def run_before_tool(self, hook_input: BeforeToolHookInput) -> dict[str, Any]:
+        current_input = hook_input.tool_input
+        for middleware in self.middlewares:
+            handler = getattr(middleware, "before_tool", None)
+            if handler is None:
+                continue
+            try:
+                hook_input.tool_input = current_input
+                result = handler(hook_input)
+                hook_result = self._normalize_result(result)
+                if hook_result.tool_input is not None:
+                    current_input = hook_result.tool_input
+                    logger.info(
+                        "🔧 Middleware %s (before_tool) modified tool input",
+                        middleware.__class__.__name__,
+                    )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f"⚠️ Before-tool middleware {middleware} failed: {exc}")
+        return current_input
+
+    def wrap_model_call(self, params: ModelCallParams, call_next: ModelCallFn) -> ModelResponse | None:
+        def invoke(index: int, current_params: ModelCallParams) -> ModelResponse | None:
+            if index >= len(self.middlewares):
+                return call_next(current_params)
+
+            middleware = self.middlewares[index]
+            wrapper = getattr(middleware, "wrap_model_call", None)
+            if wrapper is None:
+                return invoke(index + 1, current_params)
+
+            def next_handler(next_params: ModelCallParams) -> ModelResponse | None:
+                return invoke(index + 1, next_params)
+
+            return wrapper(current_params, next_handler)
+
+        return invoke(0, params)
+
+    def stream_chunk(self, chunk: Any, params: ModelCallParams) -> Any:
+        """Run stream chunks through middleware in call order."""
+
+        current_chunk = chunk
+        for middleware in self.middlewares:
+            handler = getattr(middleware, "stream_chunk", None)
+            if handler is None:
+                continue
+            try:
+                result = handler(current_chunk, params)
+                if result is None:
+                    logger.info(
+                        "🎣 Middleware %s (stream_chunk) dropped a chunk",
+                        middleware.__class__.__name__,
+                    )
+                    return None
+                if result is not current_chunk:
+                    logger.info(
+                        "🎣 Middleware %s (stream_chunk) modified a chunk",
+                        middleware.__class__.__name__,
+                    )
+                current_chunk = result
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.warning(f"⚠️ Streaming middleware {middleware} failed: {exc}")
+        return current_chunk
+
+    def wrap_tool_call(self, params: ToolCallParams, call_next: ToolCallFn) -> Any:
+        def invoke(index: int, current_params: ToolCallParams) -> Any:
+            if index >= len(self.middlewares):
+                return call_next(current_params)
+
+            middleware = self.middlewares[index]
+            wrapper = getattr(middleware, "wrap_tool_call", None)
+            if wrapper is None:
+                return invoke(index + 1, current_params)
+
+            def next_handler(next_params: ToolCallParams) -> Any:
+                return invoke(index + 1, next_params)
+
+            return wrapper(current_params, next_handler)
+
+        return invoke(0, params)
+
+    @staticmethod
+    def _normalize_result(result: HookResult | None) -> HookResult:
+        if result is None:
+            return HookResult.no_changes()
+
+        # 检测开发者误将 middleware hook 声明为 async def 的情况。
+        # 此时 result 是一个未 await 的 coroutine 而非 HookResult，
+        # 如果不检测会被静默忽略（既不报错也不生效）。
+        if inspect.iscoroutine(result):
+            # 关闭未 await 的 coroutine 以避免 RuntimeWarning
+            result.close()
+            raise TypeError(
+                "Middleware hook returned a coroutine — middleware hooks must be "
+                "synchronous (def), not async (async def). The executor runs "
+                "sync hooks via asyncio.to_thread(); if you need async I/O "
+                "inside a hook, use asyncio.run() (only safe from a non-async "
+                "worker thread, NOT from the event loop thread) or refactor to "
+                "a sync wrapper."
+            )
+
+        return result

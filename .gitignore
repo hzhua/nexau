@@ -1,0 +1,32 @@
+.nexau/
+.skills/
+.agents/
+
+*.pyc
+.env
+*.egg-info
+data/
+.DS_Store
+htmlcov/
+node_modules/
+.coverage
+to_scan.txt
+mypy_reports/
+coverage.xml
+htmlcov/
+.vscode/
+.mypy_cache/
+.hypothesis/
+.claude
+
+# Nx
+.nx/
+dist/
+tmp/
+
+vite.config.*.timestamp*
+vitest.config.*.timestamp*
+
+# Generated LLM aggregator test data (from tests/scripts/generate_llm_aggregator_logging_data.py)
+tests/test_data/llm_aggregators/
+.nexau_history_archive/

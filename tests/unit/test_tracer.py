@@ -1,0 +1,1799 @@
+"""Unit tests for tracer context management, composite tracer, and Langfuse adapter."""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from collections.abc import Iterator
+from typing import Any, cast
+
+import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
+
+from nexau.archs.tracer.adapters import InMemoryTracer, LangfuseTracer
+from nexau.archs.tracer.adapters.langfuse import _TTFT_ATTRIBUTE_KEY, _sanitize_usage
+from nexau.archs.tracer.composite import CompositeTracer
+from nexau.archs.tracer.context import (
+    TraceContext,
+    get_current_span,
+    reset_current_span,
+    set_current_span,
+)
+from nexau.archs.tracer.core import BaseTracer, Span, SpanType
+from nexau.core.usage import TokenUsage
+
+
+class RecordingTracer(BaseTracer):
+    """Simple tracer that records interactions for assertions."""
+
+    def __init__(self) -> None:
+        self.start_calls: list[dict[str, Any]] = []
+        self.end_calls: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
+        self.flush_count = 0
+        self.shutdown_count = 0
+
+    def start_span(
+        self,
+        name: str,
+        span_type: SpanType,
+        inputs: dict[str, Any] | None = None,
+        parent_span: Span | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> Span:
+        span = Span(
+            id=str(uuid.uuid4()),
+            name=name,
+            type=span_type,
+            parent_id=parent_span.id if parent_span else None,
+            inputs=inputs or {},
+            attributes=attributes or {},
+        )
+        self.start_calls.append(
+            {
+                "name": name,
+                "span_type": span_type,
+                "parent_id": parent_span.id if parent_span else None,
+            }
+        )
+        return span
+
+    def end_span(
+        self,
+        span: Span,
+        outputs: Any = None,
+        error: Exception | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        self.end_calls.append(
+            {
+                "span": span,
+                "outputs": outputs,
+                "error": error,
+                "attributes": attributes,
+            }
+        )
+
+    def flush(self) -> None:
+        self.flush_count += 1
+
+    def shutdown(self) -> None:
+        self.shutdown_count += 1
+
+
+class FakeBackendTracer(BaseTracer):
+    """Tracer used to validate CompositeTracer behavior with vendor objects."""
+
+    def __init__(self) -> None:
+        self.start_calls: list[dict[str, Any]] = []
+        self.end_calls: list[dict[str, Any]] = []
+        self.events: list[dict[str, Any]] = []
+        self.flush_count = 0
+        self.shutdown_count = 0
+
+    def start_span(
+        self,
+        name: str,
+        span_type: SpanType,
+        inputs: dict[str, Any] | None = None,
+        parent_span: Span | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> Span:
+        vendor_handle: dict[str, Any] = {"name": name, "events": []}
+        self.start_calls.append({"name": name, "parent_vendor": getattr(parent_span, "vendor_obj", None)})
+        return Span(
+            id=str(uuid.uuid4()),
+            name=name,
+            type=span_type,
+            vendor_obj=vendor_handle,
+        )
+
+    def end_span(
+        self,
+        span: Span,
+        outputs: Any = None,
+        error: Exception | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        self.end_calls.append(
+            {
+                "vendor_obj": span.vendor_obj,
+                "outputs": outputs,
+                "error": error,
+                "attributes": attributes,
+            }
+        )
+
+    def flush(self) -> None:
+        self.flush_count += 1
+
+    def shutdown(self) -> None:
+        self.shutdown_count += 1
+
+
+class DummyLangfuseObject:
+    """Minimal Langfuse object mock that stores interactions."""
+
+    def __init__(self) -> None:
+        self.start_span_calls: list[dict[str, Any]] = []
+        self.start_observation_calls: list[dict[str, Any]] = []
+        self.update_calls: list[dict[str, Any]] = []
+        self.ended = False
+        self.metadata: dict[str, Any] = {}
+        self.trace_id: str | None = None
+
+    def start_span(self, **kwargs: Any) -> DummyLangfuseObject:
+        self.start_span_calls.append(kwargs)
+        child = DummyLangfuseObject()
+        child.metadata = kwargs.get("metadata", {})
+        return child
+
+    def start_observation(self, **kwargs: Any) -> DummyLangfuseObject:
+        self.start_observation_calls.append(kwargs)
+        child = DummyLangfuseObject()
+        child.metadata = kwargs.get("metadata", {})
+        return child
+
+    def update(self, **kwargs: Any) -> None:
+        self.update_calls.append(kwargs)
+
+    def end(self) -> None:
+        self.ended = True
+
+
+class DummyLangfuseObjectGenerationFallback(DummyLangfuseObject):
+    """Dummy object that fails generation creation once, then allows span fallback."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempted_observation_types: list[str] = []
+
+    def start_observation(self, **kwargs: Any) -> DummyLangfuseObject:
+        as_type = str(kwargs.get("as_type", ""))
+        self.attempted_observation_types.append(as_type)
+        if as_type == "generation":
+            raise RuntimeError("generation-not-supported")
+        return super().start_observation(**kwargs)
+
+
+class DummyLangfuseObjectWithTrace(DummyLangfuseObject):
+    """Dummy Langfuse object that also supports trace-level updates."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.update_trace_calls: list[dict[str, Any]] = []
+
+    def update_trace(self, **kwargs: Any) -> None:
+        self.update_trace_calls.append(kwargs)
+
+
+class DummyLangfuseClient:
+    """Fake Langfuse client used to instantiate LangfuseTracer without real deps."""
+
+    instances: list[DummyLangfuseClient] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.__class__.instances.append(self)
+        self.kwargs = kwargs
+        self.start_span_calls: list[dict[str, Any]] = []
+        self.flush_count = 0
+        self.shutdown_count = 0
+
+    def start_span(self, **kwargs: Any) -> DummyLangfuseObject:
+        self.start_span_calls.append(kwargs)
+        root = DummyLangfuseObject()
+        root.trace_id = kwargs.get("trace_context", {}).get("trace_id", None)
+        root.metadata = kwargs.get("metadata", {})
+        return root
+
+    def flush(self) -> None:
+        self.flush_count += 1
+
+    def shutdown(self) -> None:
+        self.shutdown_count += 1
+
+
+@pytest.fixture(autouse=True)
+def patch_langfuse(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Patch Langfuse SDK with dummy objects for all tests in this module."""
+
+    DummyLangfuseClient.instances.clear()
+    monkeypatch.setattr("nexau.archs.tracer.adapters.langfuse.Langfuse", DummyLangfuseClient)
+    # Provide dummy credentials so LangfuseTracer can initialize the (patched) client.
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("LANGFUSE_HOST", "http://langfuse.test")
+    yield
+
+
+def test_trace_context_manages_parent_and_outputs():
+    tracer = RecordingTracer()
+
+    parent_ctx = TraceContext(tracer, "parent", SpanType.AGENT)
+    with parent_ctx as parent_span:
+        child_ctx = TraceContext(tracer, "child", SpanType.TOOL)
+        child_ctx.set_outputs({"value": 42})
+        with child_ctx as child_span:
+            assert child_span.parent_id == parent_span.id
+            assert get_current_span() == child_span
+
+        # After child exits, parent becomes current again
+        assert get_current_span() == parent_span
+
+    child_end_call = next(call for call in tracer.end_calls if call["span"].name == "child")
+    assert child_end_call["outputs"] == {"value": 42}
+    assert get_current_span() is None
+
+
+def test_trace_context_propagates_errors():
+    tracer = RecordingTracer()
+
+    with pytest.raises(RuntimeError):
+        with TraceContext(tracer, "error", SpanType.AGENT):
+            raise RuntimeError("boom")
+
+    assert isinstance(tracer.end_calls[0]["error"], RuntimeError)
+
+
+def test_trace_context_set_attributes_updates_end_span_attributes() -> None:
+    tracer = RecordingTracer()
+
+    ctx = TraceContext(tracer, "attrs", SpanType.TOOL, attributes={"a": 1})
+    with ctx:
+        ctx.set_attributes({"b": 2})
+
+    end_call = tracer.end_calls[0]
+    assert end_call["span"].name == "attrs"
+    assert end_call["attributes"] == {"a": 1, "b": 2}
+
+
+def test_context_helpers_set_and_reset():
+    tracer = RecordingTracer()
+    span = tracer.start_span("helper", SpanType.AGENT)
+    token = set_current_span(span)
+    assert get_current_span() == span
+    reset_current_span(token)
+    assert get_current_span() is None
+
+
+def test_composite_tracer_broadcasts_calls():
+    backend_a = FakeBackendTracer()
+    backend_b = FakeBackendTracer()
+    composite = CompositeTracer([backend_a, backend_b])
+
+    root_span = composite.start_span("root", SpanType.AGENT)
+    child_span = composite.start_span("child", SpanType.TOOL, parent_span=root_span)
+
+    assert isinstance(child_span.vendor_obj, dict)
+    assert isinstance(root_span.vendor_obj, dict)
+    root_vendor_obj = cast(dict[int, Any], root_span.vendor_obj)
+    assert backend_a.start_calls[1]["parent_vendor"] == root_vendor_obj[0]
+
+    composite.end_span(child_span, outputs={"status": "ok"})
+    assert backend_b.end_calls[0]["outputs"] == {"status": "ok"}
+
+    composite.flush()
+    composite.shutdown()
+    assert backend_a.flush_count == 1
+    assert backend_b.shutdown_count == 1
+
+
+def test_composite_tracer_handles_backend_errors():
+    class ExplodingTracer(FakeBackendTracer):
+        def start_span(self, *args: Any, **kwargs: Any) -> Span:
+            raise ValueError("fail")
+
+    backend = FakeBackendTracer()
+    composite = CompositeTracer([ExplodingTracer(), backend])
+
+    span = composite.start_span("root", SpanType.AGENT)
+    assert isinstance(span.vendor_obj, dict)
+    vendor_obj = cast(dict[int, Any], span.vendor_obj)
+    assert vendor_obj[1]["name"] == "root"
+
+
+def test_in_memory_tracer_dumps_nested_spans():
+    tracer = InMemoryTracer()
+    root = tracer.start_span("root", SpanType.AGENT, inputs={"foo": "bar"})
+    child = tracer.start_span("child", SpanType.TOOL, parent_span=root, attributes={"nested": True})
+
+    tracer.end_span(child, outputs="child-result")
+    tracer.end_span(root, outputs={"status": "ok"}, attributes={"stage": "test"})
+
+    traces = tracer.dump_traces()
+    assert len(traces) == 1
+
+    root_dump = traces[0]
+    assert root_dump["name"] == "root"
+    assert root_dump["outputs"]["status"] == "ok"
+    assert root_dump["children"][0]["name"] == "child"
+    assert root_dump["children"][0]["outputs"]["result"] == "child-result"
+    assert root_dump["children"][0]["parent_id"] == root.id
+
+
+def test_in_memory_tracer_works_with_composite():
+    memory_tracer = InMemoryTracer()
+    other_tracer = FakeBackendTracer()
+    composite = CompositeTracer([memory_tracer, other_tracer])
+
+    root = composite.start_span("root", SpanType.AGENT)
+    child = composite.start_span("child", SpanType.LLM, parent_span=root)
+
+    composite.end_span(child, outputs={"text": "hello"})
+    composite.end_span(root, outputs={"status": "done"})
+
+    dumped = memory_tracer.dump_traces()
+    assert dumped[0]["outputs"]["status"] == "done"
+    assert dumped[0]["children"][0]["outputs"]["text"] == "hello"
+
+
+def test_langfuse_tracer_creates_trace_and_generation():
+    tracer = LangfuseTracer(debug=True)
+    root_inputs = {"payload": (1, "two")}
+    root_span = tracer.start_span("root", SpanType.AGENT, inputs=root_inputs)
+
+    client = DummyLangfuseClient.instances[-1]
+    assert client.start_span_calls[0]["input"] == {"payload": [1, "two"]}
+    assert isinstance(root_span.vendor_obj, DummyLangfuseObject)
+
+    llm_span = tracer.start_span(
+        "llm",
+        SpanType.LLM,
+        parent_span=root_span,
+        attributes={"foo": "bar"},
+    )
+    assert root_span.vendor_obj.start_observation_calls[0]["as_type"] == "generation"
+    llm_vendor_obj = cast(DummyLangfuseObject, llm_span.vendor_obj)
+    assert llm_vendor_obj.metadata["span_type"] == SpanType.LLM.value
+
+
+def test_langfuse_tracer_llm_generation_falls_back_to_span():
+    tracer = LangfuseTracer(debug=True)
+    root_span = tracer.start_span("root", SpanType.AGENT)
+    fallback_parent = DummyLangfuseObjectGenerationFallback()
+    root_span.vendor_obj = fallback_parent
+
+    llm_span = tracer.start_span("llm", SpanType.LLM, parent_span=root_span)
+
+    assert llm_span.vendor_obj is not None
+    assert fallback_parent.attempted_observation_types == ["generation", "span"]
+    assert fallback_parent.start_observation_calls[0]["as_type"] == "span"
+
+
+def test_sanitize_usage_filters_non_int_values():
+    """_sanitize_usage should only keep int values, dropping non-int (str, None, dict, etc.)."""
+    # VertexAI 风格: modality 是 str（prompt_tokens 映射为 input_tokens）
+    assert _sanitize_usage({"prompt_tokens": 10, "completion_tokens": 20, "modality": "text"}) == {
+        "input_tokens": 10,
+        "completion_tokens": 20,
+    }
+    # 嵌套 dict（空 details 不提取任何字段）；total_tokens 映射为 Langfuse 规范 `total`
+    assert _sanitize_usage({"total_tokens": 30, "completion_tokens_details": {}}) == {
+        "total": 30,
+    }
+    # None 值
+    assert _sanitize_usage({"input_tokens": 5, "audio_tokens": None}) == {"input_tokens": 5}
+    # 全是 int: 未知字段透传
+    assert _sanitize_usage({"a": 1, "b": 2}) == {"a": 1, "b": 2}
+    # 空 dict
+    assert _sanitize_usage({}) == {}
+
+
+def test_sanitize_usage_maps_cache_fields_to_langfuse_names():
+    """TokenUsage cache fields should be mapped to Langfuse-recognized names.
+
+    NAC 内部用 cache_read_tokens / cache_creation_tokens，
+    Langfuse UI 识别 cache_read_input_tokens / cache_creation_input_tokens。
+    input_tokens_uncached 是内部调试字段，不应上报 Langfuse。
+    """
+    usage = TokenUsage(
+        input_tokens=70,
+        completion_tokens=20,
+        reasoning_tokens=3,
+        total_tokens=100,
+        cache_creation_tokens=5,
+        cache_read_tokens=10,
+        input_tokens_uncached=70,
+    )
+
+    assert _sanitize_usage(usage) == {
+        "input_tokens": 70,
+        "completion_tokens": 20,
+        "reasoning_tokens": 3,
+        "total": 100,
+        "cache_creation_input_tokens": 5,
+        "cache_read_input_tokens": 10,
+    }
+
+
+def test_sanitize_usage_maps_raw_dict_cache_fields():
+    """Raw dict with NAC-style cache fields should also be mapped."""
+    raw = {
+        "input_tokens": 50,
+        "completion_tokens": 30,
+        "total_tokens": 90,
+        "cache_read_tokens": 10,
+        "cache_creation_tokens": 5,
+        "input_tokens_uncached": 50,
+    }
+    assert _sanitize_usage(raw) == {
+        "input_tokens": 50,
+        "completion_tokens": 30,
+        "total": 90,
+        "cache_read_input_tokens": 10,
+        "cache_creation_input_tokens": 5,
+    }
+
+
+def test_sanitize_usage_passes_through_unknown_fields():
+    """Unknown int fields should be passed through without mapping."""
+    raw = {"input_tokens": 10, "custom_provider_field": 42}
+    result = _sanitize_usage(raw)
+    assert result == {"input_tokens": 10, "custom_provider_field": 42}
+
+
+def test_sanitize_usage_extracts_openai_nested_cache_fields():
+    """OpenAI ChatCompletion 将 cache/reasoning 嵌套在 details 子 dict 中，应被提取并映射。"""
+    raw: dict[str, object] = {
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "total_tokens": 150,
+        "prompt_tokens_details": {"cached_tokens": 10, "audio_tokens": 0},
+        "completion_tokens_details": {"reasoning_tokens": 5, "audio_tokens": 0},
+    }
+    result = _sanitize_usage(raw)
+    assert result == {
+        "input_tokens": 100,
+        "completion_tokens": 50,
+        "total": 150,
+        "cache_read_input_tokens": 10,
+        "audio_tokens": 0,
+        "reasoning_tokens": 5,
+    }
+
+
+def test_sanitize_usage_maps_gemini_enriched_usage():
+    """Gemini enriched usage 使用 cached_tokens，应映射为 cache_read_input_tokens。"""
+    raw: dict[str, object] = {
+        "input_tokens": 80,
+        "output_tokens": 40,
+        "total_tokens": 130,
+        "cached_tokens": 15,
+        "reasoning_tokens": 10,
+    }
+    result = _sanitize_usage(raw)
+    assert result == {
+        "input_tokens": 80,
+        "completion_tokens": 40,
+        "total": 130,
+        "cache_read_input_tokens": 15,
+        "reasoning_tokens": 10,
+    }
+
+
+def test_sanitize_usage_anthropic_raw_response():
+    """Anthropic 原始响应字段名已与 Langfuse 一致，应直接透传。"""
+    raw: dict[str, object] = {
+        "input_tokens": 70,
+        "output_tokens": 30,
+        "cache_read_input_tokens": 10,
+        "cache_creation_input_tokens": 5,
+    }
+    result = _sanitize_usage(raw)
+    assert result == {
+        "input_tokens": 70,
+        "completion_tokens": 30,
+        "cache_read_input_tokens": 10,
+        "cache_creation_input_tokens": 5,
+    }
+
+
+def test_sanitize_usage_total_uses_canonical_key_not_double_counted():
+    """回归：provider 预聚合总数必须以字面量 `total` 上报，避免 Langfuse 二次累加。
+
+    Langfuse ingestion 规则：usage_details 若无字面量 `total` key，则把 map 内**所有值
+    求和**作为 total。历史 bug 把总数留作 `total_tokens`（带后缀），于是 input + output +
+    total_tokens ≈ 2× total，UI 上 token 数虚高约 2 倍。映射成 `total` 后 Langfuse 直接
+    采用该权威值，不再求和。
+    """
+    usage = TokenUsage(
+        input_tokens=300,
+        completion_tokens=20,
+        reasoning_tokens=6,
+        total_tokens=320,
+    )
+    result = _sanitize_usage(usage)
+
+    # 必须用规范 `total`，且不得再出现会被当作额外拆分项的 `total_tokens`
+    assert result["total"] == 320
+    assert "total_tokens" not in result
+
+    # 模拟 Langfuse 的「无字面量 total 则全量求和」逻辑：有 `total` 时它直接采用该值，
+    # 不会把拆分项叠加上去（这正是修复点）。
+    langfuse_total = result["total"] if "total" in result else sum(result.values())
+    assert langfuse_total == 320  # 修复前会是 ~646（320 拆分 + 320 total_tokens）
+
+
+def test_sanitize_usage_anthropic_nested_cache_buckets_not_double_counted():
+    """回归：Anthropic 嵌套 details 子桶不得被提升后二次累加进 total。
+
+    Anthropic 原始 usage 无字面量 total，且把 cache_creation 的 TTL 明细放在嵌套
+    `cache_creation` 子 dict、thinking 明细放在 `output_tokens_details` 子 dict：
+
+        {"input_tokens": 4644, "cache_creation_input_tokens": 37112,
+         "cache_creation": {"ephemeral_5m_input_tokens": 37112, "ephemeral_1h_input_tokens": 0},
+         "output_tokens": 101, "output_tokens_details": {"thinking_tokens": 0}}
+
+    _flatten_usage_dict 会把 ephemeral_5m/1h、thinking_tokens 提升到顶层，它们与
+    顶层 cache_creation_input_tokens / output_tokens 重叠。Anthropic 无 total →
+    Langfuse 全量求和 → cache_creation 被算两次（实测 total 多算 37112）。修复：
+    这些重叠子桶映射为 None 丢弃，顶层聚合字段已承载其值。
+    """
+    raw: dict[str, object] = {
+        "input_tokens": 4644,
+        "cache_creation_input_tokens": 37112,
+        "cache_read_input_tokens": 0,
+        "cache_creation": {"ephemeral_5m_input_tokens": 37112, "ephemeral_1h_input_tokens": 0},
+        "output_tokens": 101,
+        "output_tokens_details": {"thinking_tokens": 0},
+    }
+    result = _sanitize_usage(raw)
+
+    # 重叠子桶被丢弃，只保留顶层互斥聚合项
+    assert "ephemeral_5m_input_tokens" not in result
+    assert "ephemeral_1h_input_tokens" not in result
+    assert "thinking_tokens" not in result
+    assert result == {
+        "input_tokens": 4644,
+        "cache_creation_input_tokens": 37112,
+        "cache_read_input_tokens": 0,
+        "completion_tokens": 101,
+    }
+
+    # Anthropic 无字面量 total → Langfuse 对拆分项求和。修复后求和 = 4 个互斥项之和，
+    # 不含重复的 cache_creation 明细。
+    langfuse_total = result["total"] if "total" in result else sum(result.values())
+    assert langfuse_total == 4644 + 37112 + 0 + 101  # 41857
+    # 修复前：+ ephemeral_5m 37112（被提升双计）≈ 78969，几乎 2×。
+
+
+def test_sanitize_usage_omits_zero_total_to_allow_langfuse_fallback():
+    """total<=0（直接构造、未填总数）时不写 `total`，让 Langfuse 回落到对拆分项求和。
+
+    否则会把 Langfuse 的 total 钉死成 0，盖掉真实的 input/output 用量。
+    """
+    usage = TokenUsage(input_tokens=100, completion_tokens=50)  # total_tokens 默认 0
+    result = _sanitize_usage(usage)
+
+    assert "total" not in result
+    assert result["input_tokens"] == 100
+    assert result["completion_tokens"] == 50
+
+
+def test_sanitize_usage_drops_non_int_and_bool_on_tokenusage_path():
+    """TokenUsage 路径也要强制「只保留 int」契约；bool 视为非 int 丢弃。
+
+    动态运行时可能绕过类型标注把 None/str 构造进 TokenUsage；bool 是 int 子类但
+    Langfuse 服务端 RawUsageDetails 按 `typeof value === "number"` 过滤会丢弃 JSON
+    boolean，客户端先丢与服务端语义对齐，且避免 `value <= 0` 比较抛 TypeError。
+    """
+    # 绕过类型标注构造畸形 TokenUsage（运行时合法：dataclass 不做校验）
+    usage = TokenUsage(
+        input_tokens=100,
+        completion_tokens=50,
+        total_tokens=cast(int, None),  # 畸形：None 进了 int 字段
+    )
+    result = _sanitize_usage(usage)
+    # None 的 total 被丢弃；其余字段（含默认 0 值）正常映射上报
+    assert result == {
+        "input_tokens": 100,
+        "completion_tokens": 50,
+        "reasoning_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+    assert "total" not in result
+    assert "total_tokens" not in result
+
+    # raw dict 路径：bool 被严格 int 过滤丢弃（与 Langfuse 服务端行为一致）
+    assert _sanitize_usage({"input_tokens": 10, "is_cached": True}) == {"input_tokens": 10}
+
+
+def test_sanitize_usage_maps_gemini_raw_total_token_count():
+    """Gemini REST 原始 camelCase 的 totalTokenCount 也应映射为 `total`。
+
+    nexau 自身 pipeline 已在 _enrich_gemini_trace_outputs 归一化，此处保护
+    直接用 SDK tracer 传入原始 usageMetadata 的第三方调用方，避免
+    totalTokenCount 被 Langfuse 当作额外拆分项二次累加（同一 bug class）。
+    """
+    raw: dict[str, object] = {
+        "promptTokenCount": 80,
+        "candidatesTokenCount": 40,
+        "totalTokenCount": 120,
+    }
+    result = _sanitize_usage(raw)
+    assert result["total"] == 120
+    assert "totalTokenCount" not in result
+
+
+def test_langfuse_tracer_end_span_sanitizes_usage():
+    """usage_details passed to Langfuse should be sanitized (non-int values removed)."""
+    tracer = LangfuseTracer(debug=True)
+    span = tracer.start_span("llm", SpanType.LLM)
+    # 模拟 VertexAI 风格的脏 usage
+    outputs = {
+        "model": "gemini-2.0-flash",
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "total_tokens": 30,
+            "prompt_tokens_details": {"modality": "text"},  # 嵌套 dict, 非 int
+            "service_tier": "default",  # str, 非 int
+        },
+    }
+    tracer.end_span(span, outputs=outputs)
+
+    vendor_obj = cast(DummyLangfuseObject, span.vendor_obj)
+    usage_call = next(call for call in vendor_obj.update_calls if "usage_details" in call)
+    assert usage_call["usage_details"] == {
+        "input_tokens": 10,
+        "completion_tokens": 20,
+        "total": 30,
+    }
+
+
+def test_langfuse_tracer_end_span_updates_without_flush():
+    """end_span updates vendor object but does NOT synchronously flush (#495)."""
+    tracer = LangfuseTracer(debug=True)
+    span = tracer.start_span("tool", SpanType.TOOL)
+    outputs = {"model": "gpt", "usage": {"input_tokens": 1}, "result": "ok"}
+
+    tracer.end_span(span, outputs=outputs, attributes={"color": "blue"})
+
+    vendor_obj = cast(DummyLangfuseObject, span.vendor_obj)
+    output_call = next(call for call in vendor_obj.update_calls if "output" in call)
+    model_call = next(call for call in vendor_obj.update_calls if "model" in call)
+    assert output_call["output"]["result"] == "ok"
+    assert model_call["model"] == "gpt"
+    assert vendor_obj.ended is True
+    assert tracer.client is not None
+    client = cast(DummyLangfuseClient, tracer.client)
+    assert client.flush_count == 0, "end_span must not synchronously flush (#495)"
+
+
+def test_langfuse_tracer_ttft_maps_to_completion_start_time():
+    tracer = LangfuseTracer(debug=True)
+    root_span = tracer.start_span("root", SpanType.AGENT)
+    llm_span = tracer.start_span("llm", SpanType.LLM, parent_span=root_span)
+
+    ttft_ms = 250.0
+    tracer.end_span(
+        llm_span,
+        outputs={
+            "model": "gpt",
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
+                "total_tokens": 3,
+            },
+        },
+        attributes={_TTFT_ATTRIBUTE_KEY: ttft_ms},
+    )
+
+    vendor_obj = cast(DummyLangfuseObject, llm_span.vendor_obj)
+    completion_call = next(call for call in vendor_obj.update_calls if "completion_start_time" in call)
+    completion_start_time = completion_call["completion_start_time"]
+    assert completion_start_time is not None
+    completion_start_ts = float(completion_start_time.timestamp())
+    expected_ts = llm_span.start_time + (ttft_ms / 1000.0)
+    assert abs(completion_start_ts - expected_ts) < 0.01
+
+
+def test_langfuse_tracer_end_span_updates_trace_fields_when_supported() -> None:
+    tracer = LangfuseTracer(
+        debug=True,
+        session_id="sess-123",
+        user_id="user-456",
+        tags=["tag-a", "tag-b"],
+        metadata={"meta": "value"},
+    )
+    span = tracer.start_span("tool", SpanType.TOOL)
+    assert span.vendor_obj is not None
+
+    # Swap the vendor object for one that supports trace-level updates.
+    trace_vendor = DummyLangfuseObjectWithTrace()
+    span.vendor_obj = trace_vendor
+
+    tracer.end_span(span, outputs={"result": "ok"})
+
+    # Root span (parent_id is None) updates trace name and output first,
+    # then metadata, user_id, session_id, and tags.
+    assert trace_vendor.update_trace_calls == [
+        {"name": "tool", "output": {"result": "ok"}},  # Root span sets trace name/output
+        {"metadata": {"meta": "value"}},
+        {"user_id": "user-456"},
+        {"session_id": "sess-123"},
+        {"tags": ["tag-a", "tag-b"]},
+    ]
+
+
+def test_langfuse_tracer_end_span_forwards_version() -> None:
+    """`version` is a native Langfuse trace field (the "version" column), not a tag."""
+    tracer = LangfuseTracer(debug=True, version="v-abc")
+    span = tracer.start_span("root", SpanType.TOOL)
+    assert span.vendor_obj is not None
+
+    trace_vendor = DummyLangfuseObjectWithTrace()
+    span.vendor_obj = trace_vendor
+    tracer.end_span(span, outputs={"result": "ok"})
+
+    assert {"version": "v-abc"} in trace_vendor.update_trace_calls
+
+    # 未设置时不应产生空的 version 调用
+    tracer_none = LangfuseTracer(debug=True)
+    span2 = tracer_none.start_span("root", SpanType.TOOL)
+    trace_vendor2 = DummyLangfuseObjectWithTrace()
+    span2.vendor_obj = trace_vendor2
+    tracer_none.end_span(span2, outputs={"result": "ok"})
+    assert all("version" not in c for c in trace_vendor2.update_trace_calls)
+
+
+def test_langfuse_tracer_disabled_skips_client():
+    tracer = LangfuseTracer(enabled=False)
+    span = tracer.start_span("noop", SpanType.AGENT)
+    assert span.vendor_obj is None
+    tracer.end_span(span, outputs={"ignored": True})
+
+
+def test_langfuse_serialization_handles_custom_objects():
+    class Custom:
+        def __str__(self) -> str:
+            return "custom-object"
+
+    tracer = LangfuseTracer(debug=True)
+    span = tracer.start_span("root", SpanType.AGENT, inputs={"values": (1, 2), "obj": Custom()})
+    assert span.vendor_obj is not None
+
+    client = DummyLangfuseClient.instances[-1]
+    serialized = client.start_span_calls[0]["input"]
+    assert serialized["values"] == [1, 2]
+    assert str(serialized["obj"]).replace('"', "") == "custom-object"
+
+
+def test_langfuse_ensure_client_missing_keys_warns_once(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    tracer = LangfuseTracer()
+
+    # Simulate warmup: credentials not available yet.
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+
+    caplog.set_level(logging.WARNING)
+    span_1 = tracer.start_span("first", SpanType.AGENT)
+    span_2 = tracer.start_span("second", SpanType.AGENT)
+
+    assert span_1.vendor_obj is None
+    assert span_2.vendor_obj is None
+    assert sum("public_key/secret_key missing" in rec.message for rec in caplog.records) == 1
+
+
+def test_langfuse_ensure_client_rotates_and_flushes_old_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    tracer = LangfuseTracer()
+    root_span = tracer.start_span("root", SpanType.AGENT)
+    assert root_span.vendor_obj is not None
+
+    old_client = cast(DummyLangfuseClient, tracer.client)
+    assert old_client is not None
+
+    # Rotate credentials to force client replacement and best-effort flush/shutdown of the old one.
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-rotated")
+    _ = tracer.start_span("after-rotate", SpanType.AGENT)
+
+    assert old_client.flush_count == 1
+    assert old_client.shutdown_count == 1
+    # In prod this is `Langfuse | None`, but tests monkeypatch it to `DummyLangfuseClient`.
+    assert cast(Any, tracer.client) is not old_client
+
+
+def test_langfuse_ensure_client_init_failure_logs_warning(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    class ExplodingLangfuse:
+        def __init__(self, **kwargs: Any) -> None:
+            raise RuntimeError("init-fail")
+
+    monkeypatch.setattr("nexau.archs.tracer.adapters.langfuse.Langfuse", ExplodingLangfuse)
+
+    tracer = LangfuseTracer()
+    caplog.set_level(logging.WARNING)
+    span = tracer.start_span("root", SpanType.AGENT)
+
+    assert span.vendor_obj is None
+    assert tracer.client is None
+    assert any("Langfuse tracer failed to initialize" in rec.message for rec in caplog.records)
+
+
+def test_langfuse_activate_and_deactivate_span_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    tracer = LangfuseTracer()
+
+    class DummyVendor:
+        def __init__(self) -> None:
+            self._otel_span = object()
+
+    entered: list[bool] = []
+    exited: list[bool] = []
+
+    class DummyCtx:
+        def __enter__(self) -> DummyCtx:
+            entered.append(True)
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            exited.append(True)
+
+    def fake_use_span(span: Any, *, end_on_exit: bool = False) -> DummyCtx:
+        assert span is not None
+        assert end_on_exit is False
+        return DummyCtx()
+
+    monkeypatch.setattr("nexau.archs.tracer.adapters.langfuse.otel_trace_api.use_span", fake_use_span)
+
+    span = Span(id="s", name="n", type=SpanType.AGENT, vendor_obj=DummyVendor())
+    token = tracer.activate_span(span)
+    assert token is not None
+    assert entered == [True]
+
+    tracer.deactivate_span(token)
+    assert exited == [True]
+
+
+def test_langfuse_activate_span_handles_use_span_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    tracer = LangfuseTracer()
+
+    class DummyVendor:
+        def __init__(self) -> None:
+            self._otel_span = object()
+
+    def exploding_use_span(span: Any, *, end_on_exit: bool = False) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("nexau.archs.tracer.adapters.langfuse.otel_trace_api.use_span", exploding_use_span)
+
+    span = Span(id="s", name="n", type=SpanType.AGENT, vendor_obj=DummyVendor())
+    assert tracer.activate_span(span) is None
+
+
+def test_langfuse_deactivate_span_swallows_exit_errors() -> None:
+    tracer = LangfuseTracer()
+
+    class ExplodingToken:
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            raise RuntimeError("exit-fail")
+
+    tracer.deactivate_span(ExplodingToken())
+
+
+def test_langfuse_tracer_flush_calls_client_and_logs_debug(caplog: pytest.LogCaptureFixture) -> None:
+    tracer = LangfuseTracer(debug=True)
+    _ = tracer.start_span("root", SpanType.AGENT)
+    assert tracer.client is not None
+    client = cast(DummyLangfuseClient, tracer.client)
+    before = client.flush_count
+
+    caplog.set_level(logging.DEBUG)
+    tracer.flush()
+
+    assert client.flush_count == before + 1
+    assert any("Flushed Langfuse data" in rec.message for rec in caplog.records)
+
+
+def test_langfuse_tracer_flush_handles_exception(caplog: pytest.LogCaptureFixture) -> None:
+    class ExplodingClient:
+        def flush(self) -> None:
+            raise RuntimeError("flush-fail")
+
+    tracer = LangfuseTracer(debug=True)
+    tracer.client = cast(Any, ExplodingClient())
+
+    caplog.set_level(logging.WARNING)
+    tracer.flush()
+
+    assert any("Failed to flush Langfuse data" in rec.message for rec in caplog.records)
+
+
+def test_langfuse_tracer_shutdown_calls_client_and_logs_info(caplog: pytest.LogCaptureFixture) -> None:
+    tracer = LangfuseTracer()
+    tracer.client = cast(Any, DummyLangfuseClient())
+
+    caplog.set_level(logging.INFO)
+    tracer.shutdown()
+
+    assert any("Langfuse tracer shutdown" in rec.message for rec in caplog.records)
+
+
+def test_langfuse_tracer_shutdown_handles_exception(caplog: pytest.LogCaptureFixture) -> None:
+    class ExplodingClient:
+        def shutdown(self) -> None:
+            raise RuntimeError("shutdown-fail")
+
+    tracer = LangfuseTracer()
+    tracer.client = cast(Any, ExplodingClient())
+
+    caplog.set_level(logging.WARNING)
+    tracer.shutdown()
+
+    assert any("Failed to shutdown Langfuse client" in rec.message for rec in caplog.records)
+
+
+def test_composite_tracer_flush_and_activate_deactivate_best_effort(caplog: pytest.LogCaptureFixture) -> None:
+    class ExplodingFlushTracer(FakeBackendTracer):
+        def flush(self) -> None:
+            raise RuntimeError("flush-fail")
+
+    class ActivatingTracer(FakeBackendTracer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deactivated: list[Any] = []
+
+        def activate_span(self, span: Span) -> Any | None:  # noqa: ANN401
+            return {"token_for": span.vendor_obj}
+
+        def deactivate_span(self, token: Any | None) -> None:  # noqa: ANN401
+            self.deactivated.append(token)
+
+    class ExplodingActivateTracer(FakeBackendTracer):
+        def activate_span(self, span: Span) -> Any | None:  # noqa: ANN401
+            raise RuntimeError("activate-fail")
+
+    caplog.set_level(logging.WARNING)
+    good = ActivatingTracer()
+    composite = CompositeTracer([ExplodingFlushTracer(), ExplodingActivateTracer(), good])
+
+    composite.flush()
+    assert any("Failed to flush tracer 0" in rec.message for rec in caplog.records)
+
+    # Not a vendor map => no-op for activate/deactivate
+    assert composite.activate_span(Span(id="x", name="x", type=SpanType.AGENT, vendor_obj=None)) is None
+    composite.deactivate_span("not-a-dict")
+
+    # Vendor map: activate should ignore exploding tracer and return token for good tracer only.
+    span = Span(id="s", name="n", type=SpanType.AGENT, vendor_obj={0: {"v": 0}, 1: {"v": 1}, 2: {"v": 2}})
+    token = composite.activate_span(span)
+    assert isinstance(token, dict)
+    assert 2 in token
+    assert 1 not in token
+
+    token_map = cast(dict[int, Any], token)
+    composite.deactivate_span(token_map)
+    assert len(good.deactivated) == 1
+
+
+def test_langfuse_tracer_id(caplog: pytest.LogCaptureFixture) -> None:
+    trace_id = "c86a9db70f561c9ad82d134217485867"
+    tracer = LangfuseTracer(debug=True, trace_id=trace_id)
+    span = tracer.start_span("root", SpanType.AGENT)
+    assert tracer.client is not None
+    span_vendor_obj = cast(DummyLangfuseObject, span.vendor_obj)
+    assert span_vendor_obj.trace_id == trace_id
+
+
+def test_langfuse_tracer_end_span_updates_trace_name_for_root_span() -> None:
+    """Verify that ending a root span calls update_trace(name=...) to set trace name.
+
+    This is critical defensive programming: when using trace_context.trace_id,
+    Langfuse SDK creates a trace with empty name. LangfuseTracer must explicitly
+    call update_trace(name=span.name) to ensure the trace has a meaningful name.
+
+    Without this fix, users who enable auto-instrumentation may see unnamed traces
+    in Langfuse UI because the SDK creates trace records without inheriting span names.
+    """
+    tracer = LangfuseTracer(
+        debug=True,
+        session_id="sess-123",
+        user_id="user-456",
+    )
+    root_span = tracer.start_span(
+        "Agent: test-agent",
+        SpanType.AGENT,
+        inputs={"message": "hello"},
+    )
+    assert root_span.vendor_obj is not None
+    assert root_span.parent_id is None  # Confirm this is a root span
+
+    # Swap vendor object for one that supports trace-level updates
+    trace_vendor = DummyLangfuseObjectWithTrace()
+    root_span.vendor_obj = trace_vendor
+
+    # End the root span with outputs
+    tracer.end_span(root_span, outputs={"response": "world"})
+
+    # CRITICAL: Verify update_trace was called with name for root span
+    # This ensures trace name is set even when Langfuse SDK creates empty trace
+    name_update_calls = [c for c in trace_vendor.update_trace_calls if "name" in c]
+    assert len(name_update_calls) >= 1, (
+        "update_trace(name=...) was not called for root span! "
+        "This will cause unnamed traces when using trace_context.trace_id. "
+        "Fix: Add update_trace(name=span.name) in end_span() for root spans."
+    )
+    assert name_update_calls[0]["name"] == "Agent: test-agent"
+
+    # Also verify input/output are set on trace for root spans
+    input_update_calls = [c for c in trace_vendor.update_trace_calls if "input" in c]
+    output_update_calls = [c for c in trace_vendor.update_trace_calls if "output" in c]
+    assert len(input_update_calls) >= 1, "update_trace(input=...) was not called for root span"
+    assert len(output_update_calls) >= 1, "update_trace(output=...) was not called for root span"
+
+
+def test_langfuse_tracer_end_span_does_not_update_trace_name_for_child_span() -> None:
+    """Verify that ending a child span does NOT call update_trace(name=...).
+
+    Only root spans should update trace-level fields. Child spans should not
+    overwrite the trace name set by the root span.
+    """
+    tracer = LangfuseTracer(debug=True)
+    root_span = tracer.start_span("Agent: parent", SpanType.AGENT)
+    child_span = tracer.start_span("Tool: child", SpanType.TOOL, parent_span=root_span)
+    assert child_span.parent_id == root_span.id  # Confirm this is a child span
+
+    # Swap vendor object for one that supports trace-level updates
+    trace_vendor = DummyLangfuseObjectWithTrace()
+    child_span.vendor_obj = trace_vendor
+
+    tracer.end_span(child_span, outputs={"result": "done"})
+
+    # Child span should NOT update trace name
+    name_update_calls = [c for c in trace_vendor.update_trace_calls if "name" in c]
+    assert len(name_update_calls) == 0, "update_trace(name=...) was called for child span! Only root spans should update trace-level name."
+
+
+def test_langfuse_tracer_root_span_without_inputs_skips_input_update() -> None:
+    """Verify that root span without inputs does not call update_trace(input=...).
+
+    Covers the `if span.inputs:` guard in end_span().
+    """
+    tracer = LangfuseTracer(debug=True)
+    # Start root span WITHOUT inputs
+    root_span = tracer.start_span("Agent: no-input", SpanType.AGENT)
+    assert root_span.parent_id is None
+
+    trace_vendor = DummyLangfuseObjectWithTrace()
+    root_span.vendor_obj = trace_vendor
+
+    # End without outputs either
+    tracer.end_span(root_span)
+
+    # Should have update_trace(name=...) but NOT input or output
+    name_calls = [c for c in trace_vendor.update_trace_calls if "name" in c]
+    input_calls = [c for c in trace_vendor.update_trace_calls if "input" in c]
+    output_calls = [c for c in trace_vendor.update_trace_calls if "output" in c]
+
+    assert len(name_calls) == 1, "Root span should always set trace name"
+    assert name_calls[0]["name"] == "Agent: no-input"
+    assert len(input_calls) == 0, "Root span without inputs should not call update_trace(input=...)"
+    assert len(output_calls) == 0, "Root span without outputs should not call update_trace(output=...)"
+
+
+def test_langfuse_tracer_root_span_with_inputs_but_no_outputs() -> None:
+    """Verify root span with inputs but no outputs sets input but not output on trace."""
+    tracer = LangfuseTracer(debug=True)
+    root_span = tracer.start_span(
+        "Agent: input-only",
+        SpanType.AGENT,
+        inputs={"query": "hello"},
+    )
+    assert root_span.parent_id is None
+
+    trace_vendor = DummyLangfuseObjectWithTrace()
+    root_span.vendor_obj = trace_vendor
+
+    tracer.end_span(root_span)  # No outputs
+
+    name_calls = [c for c in trace_vendor.update_trace_calls if "name" in c]
+    assert len(name_calls) == 1
+    # The first call should have name and input but NOT output
+    first_call = name_calls[0]
+    assert first_call["name"] == "Agent: input-only"
+    assert "input" in first_call, "Root span with inputs should include input in trace update"
+    assert first_call["input"] == {"query": "hello"}
+    assert "output" not in first_call, "Root span without outputs should not include output"
+
+
+def test_langfuse_ensure_client_passes_tracer_provider() -> None:
+    """Verify that _ensure_client passes tracer_provider to Langfuse constructor.
+
+    This is critical: without isolated TracerProvider, Langfuse v3+ would
+    overwrite the global TracerProvider, causing all spans to be sent to Langfuse.
+    """
+    captured_kwargs: list[dict[str, Any]] = []
+
+    class CapturingLangfuse:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.append(kwargs)
+
+    import nexau.archs.tracer.adapters.langfuse as langfuse_mod
+
+    original = langfuse_mod.Langfuse
+    langfuse_mod.Langfuse = CapturingLangfuse  # type: ignore[assignment,misc]
+    try:
+        tracer = LangfuseTracer(
+            public_key="pk-test",
+            secret_key="sk-test",
+            host="http://test.local",
+        )
+        tracer._ensure_client()
+
+        assert len(captured_kwargs) == 1, "Langfuse should be instantiated once"
+        kwargs = captured_kwargs[0]
+        assert "tracer_provider" in kwargs, (
+            "tracer_provider must be passed to Langfuse() to prevent global TracerProvider pollution. "
+            "See: https://langfuse.com/faq/all/existing-otel-setup"
+        )
+        from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
+
+        assert isinstance(kwargs["tracer_provider"], SdkTracerProvider), (
+            f"tracer_provider should be an isolated SdkTracerProvider, got {type(kwargs['tracer_provider'])}"
+        )
+    finally:
+        langfuse_mod.Langfuse = original  # type: ignore[assignment,misc]
+
+
+def test_parallel_tool_spans_have_correct_parent_with_batched_snapshots():
+    """Verify that parallel tool spans all have the Agent span as parent when using
+    the 'snapshot-before-activate' pattern (batch copy_context() before submission).
+
+    This is the core regression test for the fix-span-overlap bug: when multiple
+    tool calls are submitted to ThreadPoolExecutor, each thread's TraceContext
+    should create a Tool span whose parent_id is the Agent span, not another
+    tool's span or a polluted intermediate state.
+
+    Validates: Requirements 3.1, 3.2
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from contextvars import copy_context
+
+    tracer = RecordingTracer()
+    num_tools = 5
+    tool_spans_from_threads: list[Span] = []
+    errors: list[Exception] = []
+
+    with TraceContext(tracer, "Agent: test-agent", SpanType.AGENT) as agent_span:
+        # Step 1: Batch all context snapshots BEFORE any task submission
+        # This is the fixed pattern from executor.py
+        tool_snapshots = [(copy_context(), f"Tool: tool_{i}") for i in range(num_tools)]
+
+        # Step 2: Submit all tasks using pre-created snapshots
+        with ThreadPoolExecutor(max_workers=num_tools) as executor:
+
+            def run_tool_in_thread(tool_name: str) -> Span:
+                """Simulate a tool execution inside a TraceContext."""
+                with TraceContext(tracer, tool_name, SpanType.TOOL) as tool_span:
+                    # The tool span should see the Agent span as its parent
+                    # because copy_context() was called while Agent span was current
+                    return tool_span
+
+            futures = {}
+            for task_ctx, tool_name in tool_snapshots:
+                future = executor.submit(task_ctx.run, run_tool_in_thread, tool_name)
+                futures[future] = tool_name
+
+            for future in as_completed(futures):
+                try:
+                    tool_span = future.result()
+                    tool_spans_from_threads.append(tool_span)
+                except Exception as e:
+                    errors.append(e)
+
+    # No errors should have occurred
+    assert not errors, f"Errors during parallel execution: {errors}"
+
+    # All tool spans should have been created
+    assert len(tool_spans_from_threads) == num_tools
+
+    # CRITICAL: Every tool span's parent_id must be the Agent span's id
+    for tool_span in tool_spans_from_threads:
+        assert tool_span.parent_id == agent_span.id, (
+            f"Tool span '{tool_span.name}' has parent_id={tool_span.parent_id}, "
+            f"expected Agent span id={agent_span.id}. "
+            "This indicates OTel context pollution between parallel tool threads."
+        )
+
+    # Verify all tool spans are distinct (no duplicates)
+    tool_span_ids = [s.id for s in tool_spans_from_threads]
+    assert len(set(tool_span_ids)) == num_tools, "Tool span IDs should all be unique"
+
+    # Verify the RecordingTracer captured the correct number of start/end calls
+    # 1 Agent span + N Tool spans = N+1 total
+    assert len(tracer.start_calls) == num_tools + 1
+    assert len(tracer.end_calls) == num_tools + 1
+
+    # Verify all tool start_calls have the correct parent_id
+    tool_start_calls = [c for c in tracer.start_calls if c["span_type"] == SpanType.TOOL]
+    assert len(tool_start_calls) == num_tools
+    for call in tool_start_calls:
+        assert call["parent_id"] == agent_span.id, (
+            f"RecordingTracer captured tool start_call with parent_id={call['parent_id']}, expected {agent_span.id}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Property-Based Tests (hypothesis)
+# ---------------------------------------------------------------------------
+
+
+@given(num_tool_calls=st.integers(min_value=1, max_value=20))
+@settings(max_examples=100)
+def test_property_context_snapshot_consistency(num_tool_calls: int) -> None:
+    """Property 1: Context snapshot consistency.
+
+    For any set of N tool calls (N >= 1) being submitted to ThreadPoolExecutor,
+    all N context snapshots created by copy_context() should contain the same
+    OTel current span (the parent/Agent span), regardless of the number of tools
+    or their execution order.
+
+    This validates the "snapshot-before-activate" pattern: when copy_context()
+    calls are batched before any task submission, every snapshot captures the
+    same, unpolluted OTel context state.
+
+    **Validates: Requirements 1.1, 1.2, 1.3, 2.1, 2.2**
+    """
+    from contextvars import copy_context
+
+    from opentelemetry import context as otel_context
+    from opentelemetry import trace as otel_trace_api
+    from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
+
+    # Create a known parent span with a deterministic trace/span ID
+    parent_span_context = SpanContext(
+        trace_id=0x1234567890ABCDEF1234567890ABCDEF,
+        span_id=0xFEDCBA0987654321,
+        is_remote=False,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+    )
+    parent_span = NonRecordingSpan(context=parent_span_context)
+
+    # Attach the parent span to the current OTel context
+    new_ctx = otel_trace_api.set_span_in_context(parent_span)
+    token = otel_context.attach(new_ctx)
+
+    try:
+        # Batch N copy_context() calls — the "snapshot-before-activate" pattern
+        snapshots = [copy_context() for _ in range(num_tool_calls)]
+
+        # Verify every snapshot contains the same OTel current span
+        for i, snapshot in enumerate(snapshots):
+            captured_span = snapshot.run(otel_trace_api.get_current_span)
+            assert captured_span is parent_span, (
+                f"Snapshot {i} captured span {captured_span!r} instead of the "
+                f"expected parent span {parent_span!r}. "
+                f"This indicates context pollution between copy_context() calls."
+            )
+
+            # Also verify the span context attributes match
+            captured_ctx = captured_span.get_span_context()
+            assert captured_ctx.trace_id == parent_span_context.trace_id, (
+                f"Snapshot {i} trace_id mismatch: {captured_ctx.trace_id:#x} != {parent_span_context.trace_id:#x}"
+            )
+            assert captured_ctx.span_id == parent_span_context.span_id, (
+                f"Snapshot {i} span_id mismatch: {captured_ctx.span_id:#x} != {parent_span_context.span_id:#x}"
+            )
+    finally:
+        # Always detach to restore the OTel context
+        otel_context.detach(token)
+
+
+@given(num_parallel_tools=st.integers(min_value=2, max_value=10))
+@settings(max_examples=100)
+def test_property_parallel_tool_span_parenting(num_parallel_tools: int) -> None:
+    """Property 3: Parallel tool span parenting.
+
+    For any set of N parallel tool executions (N >= 2), each tool's active span
+    inside its TraceContext should be that tool's own span, not another tool's
+    span or the server span. Specifically, for each tool thread,
+    get_current_span() should return the span created by that tool's
+    TraceContext.__enter__, and each Tool span's parent_id should be the Agent
+    span's id.
+
+    This validates the "snapshot-before-activate" pattern: when copy_context()
+    calls are batched before any task submission, each thread's TraceContext
+    creates a Tool span whose parent is the Agent span, and the active span
+    inside each thread is that thread's own Tool span.
+
+    **Validates: Requirements 3.1, 3.2, 4.1**
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from contextvars import copy_context
+
+    tracer = RecordingTracer()
+    results: list[dict[str, Any]] = []
+    errors: list[Exception] = []
+
+    with TraceContext(tracer, "Agent: property-test", SpanType.AGENT) as agent_span:
+        # Step 1: Batch all context snapshots BEFORE any task submission
+        tool_snapshots = [(copy_context(), f"Tool: prop_tool_{i}") for i in range(num_parallel_tools)]
+
+        # Step 2: Submit all tasks using pre-created snapshots
+        with ThreadPoolExecutor(max_workers=num_parallel_tools) as executor:
+
+            def run_tool_in_thread(tool_name: str) -> dict[str, Any]:
+                """Execute a tool inside TraceContext and capture active span info."""
+                with TraceContext(tracer, tool_name, SpanType.TOOL) as tool_span:
+                    # Capture the active span inside this thread's TraceContext
+                    active_span = get_current_span()
+                    return {
+                        "tool_name": tool_name,
+                        "tool_span_id": tool_span.id,
+                        "tool_span_name": tool_span.name,
+                        "tool_span_parent_id": tool_span.parent_id,
+                        "active_span_id": active_span.id if active_span else None,
+                        "active_span_name": active_span.name if active_span else None,
+                    }
+
+            futures = {}
+            for task_ctx, tool_name in tool_snapshots:
+                future = executor.submit(task_ctx.run, run_tool_in_thread, tool_name)
+                futures[future] = tool_name
+
+            for future in as_completed(futures):
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    errors.append(e)
+
+    # No errors should have occurred during parallel execution
+    assert not errors, f"Errors during parallel execution: {errors}"
+
+    # All tools should have produced results
+    assert len(results) == num_parallel_tools
+
+    for result in results:
+        tool_name = result["tool_name"]
+
+        # CRITICAL Property 3a: Each tool span's parent_id must be the Agent span's id
+        assert result["tool_span_parent_id"] == agent_span.id, (
+            f"Tool '{tool_name}' has parent_id={result['tool_span_parent_id']}, "
+            f"expected Agent span id={agent_span.id}. "
+            "This indicates OTel context pollution — the tool's parent is wrong."
+        )
+
+        # CRITICAL Property 3b: The active span inside each thread's TraceContext
+        # must be that thread's own Tool span, not another tool's span
+        assert result["active_span_id"] == result["tool_span_id"], (
+            f"Tool '{tool_name}' active span id={result['active_span_id']} "
+            f"does not match its own tool span id={result['tool_span_id']}. "
+            "This indicates context cross-contamination between parallel threads."
+        )
+        assert result["active_span_name"] == tool_name, (
+            f"Tool '{tool_name}' active span name='{result['active_span_name']}' "
+            f"does not match expected name='{tool_name}'. "
+            "Another tool's span is active in this thread's context."
+        )
+
+    # All tool span IDs should be unique (no duplicates)
+    tool_span_ids = [r["tool_span_id"] for r in results]
+    assert len(set(tool_span_ids)) == num_parallel_tools, (
+        f"Expected {num_parallel_tools} unique tool span IDs, got {len(set(tool_span_ids))}. Duplicate spans detected."
+    )
+
+
+@given(nesting_depth=st.integers(min_value=1, max_value=5))
+@settings(max_examples=100)
+def test_property_context_restoration_after_exit(nesting_depth: int) -> None:
+    """Property 4: Context restoration after TraceContext exit.
+
+    For any TraceContext usage, after __exit__ completes, the OTel current span
+    should be restored to the span that was active before __enter__ was called.
+
+    This test creates nested TraceContext instances to a random depth (1-5) and
+    verifies that after each __exit__, the current span is correctly restored to
+    the span that was active before the corresponding __enter__.
+
+    **Validates: Requirements 3.3**
+    """
+    tracer = RecordingTracer()
+
+    # Define span types to cycle through for nested contexts
+    span_types = [SpanType.AGENT, SpanType.TOOL, SpanType.LLM, SpanType.SUB_AGENT, SpanType.TOOL]
+
+    # Before any context is entered, current span should be None
+    assert get_current_span() is None
+
+    # Build nested contexts: enter them one by one, tracking each span
+    contexts: list[TraceContext] = []
+    spans: list[Span] = []
+
+    for depth in range(nesting_depth):
+        span_type = span_types[depth % len(span_types)]
+        name = f"span_depth_{depth}"
+        ctx = TraceContext(tracer, name, span_type)
+        span = ctx.__enter__()
+        contexts.append(ctx)
+        spans.append(span)
+
+        # After entering, the current span should be the one we just created
+        assert get_current_span() is span, (
+            f"After entering depth {depth}, current span should be '{name}' (id={span.id}), but got {get_current_span()!r}"
+        )
+
+        # Verify parent relationship: each span's parent should be the previous span
+        if depth > 0:
+            assert span.parent_id == spans[depth - 1].id, (
+                f"Span at depth {depth} should have parent_id={spans[depth - 1].id}, but got parent_id={span.parent_id}"
+            )
+        else:
+            # The first span should have no parent (None was current before entering)
+            assert span.parent_id is None, f"Root span at depth 0 should have parent_id=None, but got parent_id={span.parent_id}"
+
+    # Now exit contexts in reverse order (LIFO) and verify restoration
+    for depth in range(nesting_depth - 1, -1, -1):
+        ctx = contexts[depth]
+        ctx.__exit__(None, None, None)
+
+        if depth > 0:
+            # After exiting this context, the current span should be the parent span
+            expected_span = spans[depth - 1]
+            actual_span = get_current_span()
+            assert actual_span is expected_span, (
+                f"After exiting depth {depth}, current span should be restored to "
+                f"'{expected_span.name}' (id={expected_span.id}), "
+                f"but got {actual_span!r}"
+            )
+        else:
+            # After exiting the outermost context, current span should be None
+            assert get_current_span() is None, (
+                f"After exiting the outermost context (depth 0), current span should be None, but got {get_current_span()!r}"
+            )
+
+    # Final verification: no span should be active
+    assert get_current_span() is None, "After all contexts have exited, no span should be active"
+
+
+@given(num_tracers=st.integers(min_value=1, max_value=5))
+@settings(max_examples=100)
+def test_property_lifo_deactivation_order(num_tracers: int) -> None:
+    """Property 2: LIFO deactivation order.
+
+    For any sequence of activate_span calls across K tracers in a CompositeTracer,
+    calling deactivate_span should restore the OTel context to the state before
+    the corresponding activate_span, following LIFO (last-in-first-out) order.
+
+    This test creates K OTel-context-aware tracers in a CompositeTracer, activates
+    a span, then deactivates it, and verifies the OTel current span is restored
+    to the pre-activation state.
+
+    **Validates: Requirements 2.3**
+    """
+    from opentelemetry import context as otel_context
+    from opentelemetry import trace as otel_trace_api
+    from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
+
+    class OTelContextTracer(BaseTracer):
+        """Tracer that modifies OTel context on activate/deactivate, similar to JaegerTracer.
+
+        Each instance creates its own OTel span and attaches it to the global
+        OTel context on activate_span, then detaches on deactivate_span.
+        """
+
+        def __init__(self, tracer_id: int) -> None:
+            self.tracer_id = tracer_id
+
+        def start_span(
+            self,
+            name: str,
+            span_type: SpanType,
+            inputs: dict[str, Any] | None = None,
+            parent_span: Span | None = None,
+            attributes: dict[str, Any] | None = None,
+        ) -> Span:
+            # Create a unique OTel span for this tracer
+            otel_span = NonRecordingSpan(
+                context=SpanContext(
+                    trace_id=0xAAAABBBBCCCCDDDD0000000000000000 + self.tracer_id,
+                    span_id=0x1111222233330000 + self.tracer_id,
+                    is_remote=False,
+                    trace_flags=TraceFlags(TraceFlags.SAMPLED),
+                )
+            )
+            return Span(
+                id=str(uuid.uuid4()),
+                name=name,
+                type=span_type,
+                vendor_obj=otel_span,
+            )
+
+        def end_span(
+            self,
+            span: Span,
+            outputs: Any = None,
+            error: Exception | None = None,
+            attributes: dict[str, Any] | None = None,
+        ) -> None:
+            pass
+
+        def activate_span(self, span: Span) -> Any | None:  # noqa: ANN401
+            """Attach the OTel span to the global context, like JaegerTracer does."""
+            otel_span = span.vendor_obj
+            if otel_span is None:
+                return None
+            new_ctx = otel_trace_api.set_span_in_context(cast(otel_trace_api.Span, otel_span))
+            token = otel_context.attach(new_ctx)
+            return token
+
+        def deactivate_span(self, token: Any | None) -> None:  # noqa: ANN401
+            """Detach the OTel context, restoring the previous state."""
+            if token is None:
+                return
+            otel_context.detach(token)
+
+    # Set up a known "pre-activation" OTel context with a parent span
+    parent_span_context = SpanContext(
+        trace_id=0xDEADBEEFDEADBEEF0000000000000000,
+        span_id=0xCAFEBABECAFE0000,
+        is_remote=False,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+    )
+    parent_otel_span = NonRecordingSpan(context=parent_span_context)
+
+    # Attach the parent span to establish the pre-activation state
+    pre_ctx = otel_trace_api.set_span_in_context(parent_otel_span)
+    pre_token = otel_context.attach(pre_ctx)
+
+    try:
+        # Capture the pre-activation OTel current span
+        pre_activation_span = otel_trace_api.get_current_span()
+        assert pre_activation_span is parent_otel_span, "Pre-activation span should be the parent span we just attached"
+
+        # Create K OTel-context-aware tracers and compose them
+        tracers: list[BaseTracer] = [OTelContextTracer(i) for i in range(num_tracers)]
+        composite = CompositeTracer(tracers)
+
+        # Create a span via the CompositeTracer
+        span = composite.start_span("test-span", SpanType.TOOL)
+
+        # Activate the span — this will call activate_span on each tracer,
+        # each of which attaches its own OTel span to the context
+        activate_token = composite.activate_span(span)
+
+        # After activation, the OTel current span should NOT be the parent span
+        # (it should be the last tracer's span, since each tracer overwrites)
+        post_activation_span = otel_trace_api.get_current_span()
+        if num_tracers > 0:
+            assert post_activation_span is not parent_otel_span, (
+                "After activation, the OTel current span should have been changed by the tracers' activate_span calls"
+            )
+
+        # Deactivate the span — this should restore the OTel context
+        # to the pre-activation state (LIFO unwinding)
+        composite.deactivate_span(activate_token)
+
+        # CRITICAL PROPERTY: After deactivation, the OTel current span
+        # should be exactly the same as before activation
+        post_deactivation_span = otel_trace_api.get_current_span()
+        assert post_deactivation_span is parent_otel_span, (
+            f"After deactivate_span, the OTel current span should be restored "
+            f"to the pre-activation parent span. "
+            f"Expected: {parent_otel_span!r} (trace_id={parent_span_context.trace_id:#x}), "
+            f"Got: {post_deactivation_span!r}. "
+            f"This indicates LIFO deactivation order is broken with {num_tracers} tracers."
+        )
+
+        # Also verify the span context attributes match exactly
+        restored_ctx = post_deactivation_span.get_span_context()
+        assert restored_ctx.trace_id == parent_span_context.trace_id, (
+            f"Restored trace_id {restored_ctx.trace_id:#x} != expected {parent_span_context.trace_id:#x}"
+        )
+        assert restored_ctx.span_id == parent_span_context.span_id, (
+            f"Restored span_id {restored_ctx.span_id:#x} != expected {parent_span_context.span_id:#x}"
+        )
+    finally:
+        # Always restore the OTel context to clean state
+        otel_context.detach(pre_token)
+
+
+# ---------------------------------------------------------------------------
+# #495: end_span flush behavior
+# ---------------------------------------------------------------------------
+
+
+def test_langfuse_end_span_no_sync_flush_on_root() -> None:
+    """end_span must NOT synchronously flush — even on root span (no event loop).
+
+    #495: No synchronous flush without event loop; relies on SDK batch worker
+    """
+    tracer = LangfuseTracer(
+        public_key="pk-test",
+        secret_key="sk-test",
+        host="http://langfuse.test",
+    )
+    tracer._ensure_client()
+    assert len(DummyLangfuseClient.instances) == 1
+    client = DummyLangfuseClient.instances[0]
+
+    root_span = tracer.start_span("root-agent", SpanType.AGENT)
+    tracer.end_span(root_span, outputs={"result": "ok"})
+    assert client.flush_count == 0, (
+        "end_span must not synchronously flush on root span completion "
+        "(would block event loop via Queue.join). "
+        "See: https://github.com/Nex-AGI/nexau/issues/495"
+    )
+
+    child_span = tracer.start_span("llm-call", SpanType.LLM, parent_span=root_span)
+    tracer.end_span(child_span, outputs={"text": "hello"})
+    assert client.flush_count == 0, "Child span should not trigger flush either"
+
+    tracer.flush()
+    assert client.flush_count == 1, "Explicit flush() should still work"
+
+
+def test_langfuse_end_span_async_flush_on_root() -> None:
+    """end_span fires an async flush on root span when event loop is running.
+
+    #495: Async fire-and-forget flush on root span end when event loop is running
+    """
+    import asyncio
+
+    tracer = LangfuseTracer(
+        public_key="pk-test",
+        secret_key="sk-test",
+        host="http://langfuse.test",
+    )
+    tracer._ensure_client()
+    client = DummyLangfuseClient.instances[-1]
+
+    async def _test() -> None:
+        root_span = tracer.start_span("root-agent", SpanType.AGENT)
+        tracer.end_span(root_span, outputs={"result": "ok"})
+        assert client.flush_count == 0, "Flush should not happen synchronously"
+        await asyncio.sleep(0.05)
+        assert client.flush_count == 1, "Async flush should have run after root span end"
+
+        child_span = tracer.start_span("llm-call", SpanType.LLM, parent_span=root_span)
+        tracer.end_span(child_span, outputs={"text": "hello"})
+        await asyncio.sleep(0.05)
+        assert client.flush_count == 1, "Child span should not trigger async flush"
+
+    asyncio.run(_test())
+
+
+# ---------------------------------------------------------------------------
+# #495: Credential rotation — async old-client cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_client_credential_rotation_offloads_async_cleanup() -> None:
+    """When credentials change with a running event loop, old client cleanup
+    is offloaded to a background task (not synchronous).
+
+    #495: Old client cleanup should run async during credential rotation
+    """
+    import asyncio
+
+    tracer = LangfuseTracer(
+        public_key="pk-old",
+        secret_key="sk-old",
+        host="http://langfuse.test",
+    )
+    tracer._ensure_client()
+    assert len(DummyLangfuseClient.instances) == 1
+    old_client = DummyLangfuseClient.instances[0]
+
+    tracer._init_public_key = "pk-new"
+    tracer._init_secret_key = "sk-new"
+
+    async def _rotate() -> None:
+        tracer._ensure_client()
+        await asyncio.sleep(0.05)
+
+    asyncio.run(_rotate())
+
+    assert old_client.flush_count == 1, "Old client should be flushed during rotation"
+    assert old_client.shutdown_count == 1, "Old client should be shutdown during rotation"
+    assert len(DummyLangfuseClient.instances) == 2
+
+
+def test_ensure_client_credential_rotation_sync_fallback() -> None:
+    """When credentials change with NO running event loop, old client cleanup
+    falls back to synchronous best-effort.
+
+    #495: Falls back to synchronous cleanup when no event loop is available
+    """
+    tracer = LangfuseTracer(
+        public_key="pk-old",
+        secret_key="sk-old",
+        host="http://langfuse.test",
+    )
+    tracer._ensure_client()
+    old_client = DummyLangfuseClient.instances[0]
+
+    tracer._init_public_key = "pk-new"
+    tracer._init_secret_key = "sk-new"
+    tracer._ensure_client()
+
+    assert old_client.flush_count == 1, "Sync fallback should flush old client"
+    assert old_client.shutdown_count == 1, "Sync fallback should shutdown old client"
+    assert len(DummyLangfuseClient.instances) == 2
+
+
+def test_async_cleanup_old_client_timeout() -> None:
+    """Async old-client cleanup should not hang indefinitely — timeout fires.
+
+    #495: Async cleanup must not hang indefinitely; timeout should abort
+    """
+    import asyncio
+    import time
+    from unittest.mock import Mock
+
+    mock_client = Mock()
+
+    def slow_flush() -> None:
+        time.sleep(10)
+
+    mock_client.flush.side_effect = slow_flush
+    mock_client.shutdown = Mock()
+
+    tracer = LangfuseTracer(
+        public_key="pk-test",
+        secret_key="sk-test",
+        host="http://langfuse.test",
+    )
+
+    coroutine_elapsed: float = 0.0
+
+    async def _test() -> None:
+        nonlocal coroutine_elapsed
+        tracer._ASYNC_OP_TIMEOUT = 0.1
+        start = time.monotonic()
+        await tracer._async_cleanup_old_client(mock_client)
+        coroutine_elapsed = time.monotonic() - start
+
+    asyncio.run(_test())
+
+    assert coroutine_elapsed < 2.0, f"Coroutine should have timed out quickly, took {coroutine_elapsed:.1f}s"
+
+
+# ---------------------------------------------------------------------------
+# #495: Agent.sync_cleanup wires tracer.shutdown()
+# ---------------------------------------------------------------------------
+
+
+def test_agent_sync_cleanup_calls_tracer_shutdown() -> None:
+    """Agent.sync_cleanup() should call tracer.shutdown() to flush buffered
+    trace data before process exit.
+
+    #495: Prevent trace loss by calling tracer.shutdown() via sync_cleanup on exit
+    """
+    from unittest.mock import MagicMock
+
+    tracer = RecordingTracer()
+
+    mock_agent = MagicMock()
+    mock_agent.config.name = "test-agent"
+
+    mock_storage = MagicMock()
+    mock_storage.get.return_value = tracer
+    mock_agent.global_storage = mock_storage
+    mock_agent.executor = MagicMock()
+
+    from nexau.archs.main_sub.agent import Agent
+
+    Agent.sync_cleanup(mock_agent)
+
+    assert tracer.shutdown_count == 1, "sync_cleanup should call tracer.shutdown()"
+    mock_storage.get.assert_called_once_with("tracer")
